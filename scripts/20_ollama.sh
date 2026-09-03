@@ -15,9 +15,18 @@ hdr "1. Ollama の導入"
 if have ollama; then
   ok "導入済み: $(ollama --version 2>&1 | head -1)"
 else
+  # 公式インストーラは配布アーカイブを zstd で固めるようになり、展開に zstd コマンドを
+  # 要求する。Colab の VM には既定で入っていないため、ここで先に導入しておく。
+  #   ERROR: This version requires zstd for extraction. Please install zstd and try again
+  ensure_cmd zstd
+
   log "Ollama をインストールします（1〜2 分）"
-  curl -fsSL https://ollama.com/install.sh | sh
-  have ollama || die "Ollama のインストールに失敗しました"
+  curl -fsSL https://ollama.com/install.sh | sh \
+    || die "Ollama の公式インストーラが失敗しました。上の出力を確認してください。
+     展開ツール不足なら:  apt-get install -y zstd tar
+     ネットワーク到達性は bash scripts/10_preflight.sh で確認できます。"
+  have ollama || die "インストーラは完了しましたが ollama が PATH にありません。
+     /usr/local/bin が PATH に入っているか確認してください。"
   ok "インストール完了: $(ollama --version 2>&1 | head -1)"
 fi
 

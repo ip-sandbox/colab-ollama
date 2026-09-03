@@ -78,6 +78,39 @@ ensure_dirs() { mkdir -p "$LOGDIR" "$WORKSPACE" "$STATEDIR"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# root でなければ sudo を挟む。Colab は root なのでそのまま実行される。
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    die "root 権限が必要ですが sudo がありません: $*"
+  fi
+}
+
+# ensure_cmd <コマンド名> [パッケージ名]
+#   コマンドが無ければ apt で導入する（冪等）。パッケージ名の既定はコマンド名。
+#   Colab の VM は最小構成で、公式インストーラが前提にしているツールが
+#   入っていないことがある（例: ollama の install.sh が要求する zstd）。
+ensure_cmd() {
+  local cmd="$1" pkg="${2:-$1}" aptlog
+  if have "$cmd"; then
+    return 0
+  fi
+  mkdir -p "$LOGDIR"
+  aptlog="$LOGDIR/apt.log"
+  log "$cmd がありません。apt で $pkg を導入します（ログ: $aptlog）"
+  if ! DEBIAN_FRONTEND=noninteractive as_root apt-get install -y "$pkg" >>"$aptlog" 2>&1; then
+    log "  失敗したので apt-get update してから再試行します"
+    DEBIAN_FRONTEND=noninteractive as_root apt-get update >>"$aptlog" 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive as_root apt-get install -y "$pkg" >>"$aptlog" 2>&1 \
+      || die "$pkg の導入に失敗しました。ログ: $aptlog"
+  fi
+  have "$cmd" || die "$pkg を導入しましたが $cmd が PATH にありません。ログ: $aptlog"
+  ok "$cmd を導入しました（$pkg）"
+}
+
 port_open() {
   local host="$1" port="$2"
   python3 - "$host" "$port" <<'PY'
