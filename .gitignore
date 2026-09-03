@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Colab VM 上で生成されるもの（リポジトリには入れない）
+logs/
+workspace/
+.cline-env/
