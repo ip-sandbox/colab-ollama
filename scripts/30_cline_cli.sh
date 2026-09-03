@@ -16,27 +16,46 @@ ensure_dirs
 
 hdr "1. Node.js $NODE_MAJOR"
 NEED_NODE=1
+NODE_UPGRADED=0
 if have node; then
   NODE_VER="$(node --version | tr -d 'v')"
-  [ "${NODE_VER%%.*}" -ge 20 ] && { ok "node v$NODE_VER（要件を満たしています）"; NEED_NODE=0; } \
-                               || warn "node v$NODE_VER は古いので入れ直します"
+  # Colab の既定は Node 20 系。Cline CLI は 20 でも一応起動するが、
+  #   [cline] Node 20.19.0 cannot read the OS trust store (needs >= 22.15)
+  # と警告し、OS の証明書ストアを読めないまま動く。しきい値は 20 ではなく
+  # NODE_MAJOR（既定 22）にする。
+  if [ "${NODE_VER%%.*}" -ge "$NODE_MAJOR" ]; then
+    ok "node v$NODE_VER（要件 >= $NODE_MAJOR を満たしています）"
+    NEED_NODE=0
+  else
+    warn "node v$NODE_VER は Cline CLI の要件 (>= $NODE_MAJOR) を満たしません。入れ直します。"
+  fi
 fi
 if [ "$NEED_NODE" -eq 1 ]; then
   log "NodeSource から Node $NODE_MAJOR を導入します（1〜3 分）"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - >"$LOGDIR/nodesource.log" 2>&1
-  apt-get install -y nodejs >>"$LOGDIR/nodesource.log" 2>&1
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | as_root bash - \
+       >"$LOGDIR/nodesource.log" 2>&1 \
+    || die "NodeSource のセットアップに失敗しました。ログ: $LOGDIR/nodesource.log"
+  DEBIAN_FRONTEND=noninteractive as_root apt-get install -y nodejs \
+       >>"$LOGDIR/nodesource.log" 2>&1 \
+    || die "nodejs の導入に失敗しました。ログ: $LOGDIR/nodesource.log"
   have node || die "Node の導入に失敗しました。ログ: $LOGDIR/nodesource.log"
-  ok "node $(node --version) / npm $(npm --version)"
+  NODE_UPGRADED=1
+  ok "node $(first_line node --version) / npm $(first_line npm --version)"
 fi
 
 hdr "2. Cline CLI"
-if have cline; then
-  ok "導入済み: $(cline --version 2>&1 | head -1)"
+# Node を入れ替えるとグローバル npm の prefix が変わることがあり、
+# 旧 Node 向けに入れた cline が壊れたまま PATH に残る。入れ直す。
+if have cline && [ "$NODE_UPGRADED" -eq 0 ]; then
+  ok "導入済み: $(first_line cline --version)"
 else
+  if [ "$NODE_UPGRADED" -eq 1 ]; then
+    log "Node を入れ替えたので Cline CLI を入れ直します"
+  fi
   log "npm install -g cline（1〜3 分）"
   npm install -g cline >"$LOGDIR/npm-cline.log" 2>&1 || die "導入に失敗。ログ: $LOGDIR/npm-cline.log"
   have cline || die "cline が PATH に見つかりません。ログ: $LOGDIR/npm-cline.log"
-  ok "導入完了: $(cline --version 2>&1 | head -1)"
+  ok "導入完了: $(first_line cline --version)"
 fi
 
 hdr "3. 前提の確認"

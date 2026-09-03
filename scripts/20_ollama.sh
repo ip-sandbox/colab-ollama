@@ -13,7 +13,7 @@ OLLAMA_LOG="$LOGDIR/ollama.log"
 
 hdr "1. Ollama の導入"
 if have ollama; then
-  ok "導入済み: $(ollama --version 2>&1 | head -1)"
+  ok "導入済み: $(first_line ollama --version)"
 else
   # 公式インストーラは配布アーカイブを zstd で固めるようになり、展開に zstd コマンドを
   # 要求する。Colab の VM には既定で入っていないため、ここで先に導入しておく。
@@ -27,7 +27,7 @@ else
      ネットワーク到達性は bash scripts/10_preflight.sh で確認できます。"
   have ollama || die "インストーラは完了しましたが ollama が PATH にありません。
      /usr/local/bin が PATH に入っているか確認してください。"
-  ok "インストール完了: $(ollama --version 2>&1 | head -1)"
+  ok "インストール完了: $(first_line ollama --version)"
 fi
 
 hdr "2. ollama serve の起動"

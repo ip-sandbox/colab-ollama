@@ -35,7 +35,7 @@ ok "Ollama とモデル ($CLINE_MODEL) を確認しました"
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "aider" ]; then
   hdr "1. aider"
   if have aider; then
-    ok "導入済み: $(aider --version 2>&1 | head -1)"
+    ok "導入済み: $(first_line aider --version)"
   else
     # Colab のプリインストール済みパッケージと衝突させないため、
     # 隔離環境に入れる aider-install を使う（pip 直インストールはしない）。
@@ -46,7 +46,7 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "aider" ]; then
       || die "aider の導入に失敗。ログ: $LOGDIR/aider-install.log"
     export PATH="$HOME/.local/bin:$PATH"
     have aider || die "aider が PATH に見つかりません。ログ: $LOGDIR/aider-install.log"
-    ok "導入完了: $(aider --version 2>&1 | head -1)"
+    ok "導入完了: $(first_line aider --version)"
   fi
 
   log "設定ファイルを書き出します"
@@ -90,13 +90,13 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "qwen" ]; then
   have node || die "node がありません。先に 30_cline_cli.sh を実行してください（Node $NODE_MAJOR を導入します）。"
 
   if have qwen; then
-    ok "導入済み: $(qwen --version 2>&1 | head -1)"
+    ok "導入済み: $(first_line qwen --version)"
   else
     log "npm install -g @qwen-code/qwen-code（1〜3 分）"
     npm install -g @qwen-code/qwen-code@latest >"$LOGDIR/npm-qwen.log" 2>&1 \
       || die "導入に失敗。ログ: $LOGDIR/npm-qwen.log"
     have qwen || die "qwen が PATH に見つかりません。ログ: $LOGDIR/npm-qwen.log"
-    ok "導入完了: $(qwen --version 2>&1 | head -1)"
+    ok "導入完了: $(first_line qwen --version)"
   fi
 
   log "settings.json を書き出します"
@@ -160,13 +160,13 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
   have node || die "node がありません。先に 30_cline_cli.sh を実行してください。"
 
   if have codex; then
-    ok "導入済み: $(codex --version 2>&1 | head -1)"
+    ok "導入済み: $(first_line codex --version)"
   else
     log "npm install -g @openai/codex（1〜3 分）"
     npm install -g @openai/codex >"$LOGDIR/npm-codex.log" 2>&1 \
       || die "導入に失敗。ログ: $LOGDIR/npm-codex.log"
     have codex || die "codex が PATH に見つかりません。ログ: $LOGDIR/npm-codex.log"
-    ok "導入完了: $(codex --version 2>&1 | head -1)"
+    ok "導入完了: $(first_line codex --version)"
   fi
 
   # --- モデルが tool calling に対応しているか ---------------------------

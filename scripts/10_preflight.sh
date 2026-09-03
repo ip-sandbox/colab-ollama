@@ -71,10 +71,13 @@ hdr "5. Node.js（Cline CLI の前提）"
 if have node; then
   NODE_VER="$(node --version | tr -d 'v')"
   NODE_MAJ="${NODE_VER%%.*}"
-  if [ "$NODE_MAJ" -ge 20 ]; then
-    ok "node v$NODE_VER（Cline CLI は 20 以上、22 推奨）"
+  if [ "$NODE_MAJ" -ge "$NODE_MAJOR" ]; then
+    ok "node v$NODE_VER（要件 >= $NODE_MAJOR）"
   else
-    warn "node v$NODE_VER は古すぎます。30_cline_cli.sh が Node $NODE_MAJOR を入れ直します。"
+    # Colab の既定は Node 20 系。Cline CLI は 20 でも起動するが
+    # 「cannot read the OS trust store (needs >= 22.15)」と警告する。
+    warn "node v$NODE_VER は Cline CLI の要件 (>= $NODE_MAJOR) を満たしません。
+     30_cline_cli.sh が NodeSource から Node $NODE_MAJOR を入れ直します。"
   fi
 else
   warn "node がありません。30_cline_cli.sh が Node $NODE_MAJOR を導入します。"

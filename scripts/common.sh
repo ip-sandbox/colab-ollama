@@ -78,6 +78,24 @@ ensure_dirs() { mkdir -p "$LOGDIR" "$WORKSPACE" "$STATEDIR"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# first_line <コマンド...> — 版数などを 1 行だけ安全に取り出す。
+#
+# `$(cmd 2>&1 | head -1)` を直接書いてはいけない。理由が 2 つある。
+#   1. set -Eeuo pipefail 下では、cmd が非ゼロ終了したり head -1 が
+#      早期に閉じて SIGPIPE を起こしたりすると、コマンド置換のサブシェルで
+#      ERR trap が発火し、実際には失敗していないのに [FATAL] が出る
+#      （親シェルは死なないので「FATAL の直後に OK が出る」謎の出力になる）。
+#   2. 警告を stderr に出すコマンドだと、head -1 が版数ではなく警告を拾う。
+# ここでは失敗を握りつぶし、stdout を優先して stderr にフォールバックする。
+first_line() {
+  local tmp out
+  tmp="$(mktemp)"
+  out="$("$@" 2>"$tmp" | head -1 || true)"
+  [ -n "$out" ] || out="$(head -1 "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+  printf '%s\n' "$out"
+}
+
 # root でなければ sudo を挟む。Colab は root なのでそのまま実行される。
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then

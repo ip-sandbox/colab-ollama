@@ -64,7 +64,7 @@ fi
 hdr "Node / Cline CLI"
 if have node; then mark_ok "node $(node --version)"; else mark_ng "node がありません -> bash scripts/30_cline_cli.sh"; fi
 if have cline; then
-  mark_ok "cline $(cline --version 2>&1 | head -1)"
+  mark_ok "cline $(first_line cline --version)"
   echo
   echo "    現在の設定（★ローカルの Ollama を向いているか目視確認）:"
   cline config 2>&1 | sed 's/^/      /' | head -40
