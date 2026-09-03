@@ -64,10 +64,16 @@ Colab VS Code 拡張の `Colab: Open Terminal` でも同じ VM のシェルが�
 ## 構成の要点
 
 - **推論エンジンは Ollama。** T4 は compute capability 7.5 で bf16 非対応、vLLM は不利
-- **既定モデルは 7B。** CLI の 30 秒制限下では「賢さ」より「prompt eval の速さ」が
-  実用性を決める。14B を使うかは `20_ollama.sh` のベンチ判定を見てから決める
+- **既定モデルは qwen3:8b。** `qwen2.5-coder:7b-instruct-q4_K_M` は「賢さ」も
+  prefill 速度も十分だが、Ollama の tool-calling（`<tool_call>` ラッパー）に
+  実機で確認した限り一切従わず、Cline からはファイルを 1 つも書けない
+  （チャットで説明するだけで終わる）。qwen3:8b は同条件で完走する。手順書 §5.6
 - **`num_ctx` を Modelfile に焼き込む。** 既定のままだと Cline は静かに壊れる
-- **Cline CLI は既定でクラウドに投げる。** `cline config` の出力を必ず目視確認する
+- **Cline CLI は既定でクラウドに投げる。** `providers.json` の中身を必ず目視確認する
+  （`cline config` は CLI 3.x で対話専用になり、TTY が無いと使えない）
+- **日本語プロンプトは引数ではなく標準入力で渡す。** Cline CLI 3.x はコマンドライン
+  引数に非 ASCII 文字（日本語含む）が入ると `Unknown command or unquoted prompt`
+  で必ず失敗するバグがある。`50_run.sh` は標準入力経由に変更済み。手順書 §7.2
 - **VM はステートレスとみなす。** 12 時間で全部消える。コードは git push する
 
 ## ファイル
@@ -93,3 +99,7 @@ archive/browser-ide/           v1.0（code-server / トンネル構成）。手�
 BASE_MODEL=qwen2.5-coder:14b-instruct-q4_K_M NUM_CTX=16384 bash scripts/20_ollama.sh
 CLINE_PROVIDER=openai-compatible bash scripts/30_cline_cli.sh   # 30秒制限の回避を試す
 ```
+
+`BASE_MODEL` を qwen2.5-coder 系に戻す場合は、Cline が実際にファイルを書けるか
+（チャットで説明するだけで終わっていないか）を必ず実タスクで確認してください。
+手順書 §5.6 を参照。

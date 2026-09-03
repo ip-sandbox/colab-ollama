@@ -67,7 +67,20 @@ if have cline; then
   mark_ok "cline $(first_line cline --version)"
   echo
   echo "    現在の設定（★ローカルの Ollama を向いているか目視確認）:"
-  cline config 2>&1 | sed 's/^/      /' | head -40
+  # `cline config`（引数なし）は CLI 3.x では対話専用になり TTY が無いと失敗するため、
+  # 設定ファイルを直接読む。
+  PROVIDERS_JSON="${CLINE_DATA_DIR}/data/settings/providers.json"
+  if [ -f "$PROVIDERS_JSON" ]; then
+    python3 -c "
+import json
+d = json.load(open('$PROVIDERS_JSON'))
+print('      lastUsedProvider:', d.get('lastUsedProvider'))
+p = d.get('providers', {}).get(d.get('lastUsedProvider'), {})
+print('      settings:', json.dumps(p.get('settings', {}), ensure_ascii=False))
+" 2>&1 | sed 's/^/  /'
+  else
+    echo "      $PROVIDERS_JSON が無い -> bash scripts/30_cline_cli.sh"
+  fi
 else
   mark_ng "cline がありません -> bash scripts/30_cline_cli.sh"
 fi

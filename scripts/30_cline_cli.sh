@@ -66,41 +66,40 @@ ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -q "^${CLINE_MODEL}" \
 ok "Ollama とモデルを確認しました"
 
 hdr "4. プロバイダ設定"
-# 失敗しても続行し、最後に実出力で判定する
-set +e
-cfg() {
-  log "  cline config set $1"
-  cline config set "$1" >>"$LOGDIR/cline-config.log" 2>&1
-}
-
+# 注意: `cline config set key=value` は CLI 3.x では廃止されている
+# （`error: too many arguments. Expected 1 argument but got 2.` で失敗する）。
+# `cline config` はショー専用コマンドになり、非対話での設定投入は
+# `cline auth -p <provider> -m <model> [-b <baseurl>] -k <apikey>` を使う。
+# Plan/Act 別プロバイダの概念も無くなり、`cline auth` は現行プロバイダを 1 つ設定する。
+#
+# `-b/--baseurl` は ollama プロバイダには使えない
+# （"base URL is only supported for OpenAI and OpenAI-compatible providers"）。
+# ollama プロバイダは常に既定の 127.0.0.1:11434 を見に行く。
+#
+# `-k/--apikey` は ollama では中身を見ないが必須（無いと
+# "auth quick setup requires --apikey <key>" で失敗する）。ダミー値で良い。
 case "$CLINE_PROVIDER" in
   ollama)
     log "Ollama プロバイダとして設定します"
-    # Cline は Plan モードと Act モードで別々のプロバイダを持つ。両方に入れる。
-    for mode in plan-mode act-mode; do
-      cfg "${mode}-api-provider=ollama"
-      cfg "${mode}-ollama-model-id=${CLINE_MODEL}"
-      cfg "${mode}-ollama-base-url=${OLLAMA_BASE_URL}"
-      # 実効コンテキスト長。キー名はバージョン差があるため両方試す。
-      cfg "${mode}-ollama-api-options-num-ctx=${NUM_CTX}"
-    done
+    log "  cline auth -p ollama -m $CLINE_MODEL -k ollama"
+    cline auth -p ollama -m "$CLINE_MODEL" -k ollama \
+         >>"$LOGDIR/cline-config.log" 2>&1 \
+      || warn "cline auth に失敗しました。ログ: $LOGDIR/cline-config.log"
     ;;
   openai-compatible)
     # Ollama の /v1 は OpenAI 互換。Ollama 専用ハンドラの 30 秒タイムアウト
     # （cline#9182）を迂回できる可能性がある。手順書 §7 / V-4 を参照。
+    # `-p openai` に `-b` を付けると "openai-compatible" プロバイダとして設定される。
     log "OpenAI 互換エンドポイント経由で設定します（30 秒制限の回避を狙う）"
-    for mode in plan-mode act-mode; do
-      cfg "${mode}-api-provider=openai"
-      cfg "${mode}-openai-model-id=${CLINE_MODEL}"
-      cfg "${mode}-openai-base-url=${OLLAMA_BASE_URL}/v1"
-    done
-    cfg "openai-api-key=ollama"   # 中身は何でもよいが空だと弾かれることがある
+    log "  cline auth -p openai -m $CLINE_MODEL -b ${OLLAMA_BASE_URL}/v1 -k ollama"
+    cline auth -p openai -m "$CLINE_MODEL" -b "${OLLAMA_BASE_URL}/v1" -k ollama \
+         >>"$LOGDIR/cline-config.log" 2>&1 \
+      || warn "cline auth に失敗しました。ログ: $LOGDIR/cline-config.log"
     ;;
   *)
     die "CLINE_PROVIDER は ollama か openai-compatible を指定してください（現在: $CLINE_PROVIDER）"
     ;;
 esac
-set -e
 
 hdr "5. 設定の実出力（★必ず目視で確認）"
 cat <<'EOT'
@@ -108,13 +107,28 @@ cat <<'EOT'
     反映されていなければ、対話モードで設定し直します:
 
         cline auth          # 矢印キーで Ollama を選び、モデルを選択
-        cline config        # 対話的に設定を編集
+        cline config        # 対話的に設定を編集（TTY 必須。この場では実行できない）
 
     ここを確認せずに進むと、ローカルの Ollama ではなく
     Cline のクラウドアカウントに投げ続けることになります。
 
 EOT
-cline config 2>&1 | sed 's/^/    /' || warn "cline config の実行に失敗しました"
+# `cline config`（引数なし）は CLI 3.x では対話モード専用になり、
+# TTY が無いここでは "interactive mode requires a TTY" で必ず失敗する。
+# 設定ファイルを直接見て確認する。
+PROVIDERS_JSON="${CLINE_DATA_DIR}/data/settings/providers.json"
+if [ -f "$PROVIDERS_JSON" ]; then
+  log "lastUsedProvider と設定内容 ($PROVIDERS_JSON):"
+  python3 -c "
+import json
+d = json.load(open('$PROVIDERS_JSON'))
+print('    lastUsedProvider:', d.get('lastUsedProvider'))
+p = d.get('providers', {}).get(d.get('lastUsedProvider'), {})
+print('    settings:', json.dumps(p.get('settings', {}), ensure_ascii=False))
+"
+else
+  warn "$PROVIDERS_JSON がありません。cline auth が失敗した可能性があります。"
+fi
 
 hdr "6. doctor"
 cline doctor 2>&1 | sed 's/^/    /' || warn "cline doctor でエラーが出ました（上の出力を確認）"

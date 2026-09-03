@@ -31,9 +31,12 @@ export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 export OLLAMA_MODELS="${OLLAMA_MODELS:-/root/.ollama/models}"
 
-# 既定は 7B。理由は docs/手順書.md §5 — CLI の 30 秒制限下では
-# 「賢さ」より「prompt eval の速さ」が実用性を決める。
-export BASE_MODEL="${BASE_MODEL:-qwen2.5-coder:7b-instruct-q4_K_M}"
+# 既定は qwen3:8b。理由は docs/手順書.md §5.6 — qwen2.5-coder:7b-instruct-q4_K_M は
+# 「Capabilities: tools」を名乗るが、Ollama の <tool_call> ラッパー要求に実際には従わない
+# （生の JSON をそのままテキストで返す）。Cline はそれをツール呼び出しとして解釈できず、
+# チャットで説明するだけで一切ファイルを書かない。qwen3:8b は同一条件で <tool_call> を
+# 正しく守り、実タスクが完走することを実機で確認済み（V-2 実測、2026-09-03）。
+export BASE_MODEL="${BASE_MODEL:-qwen3:8b}"
 export CLINE_MODEL="${CLINE_MODEL:-cline-coder}"
 export NUM_CTX="${NUM_CTX:-32768}"
 export NUM_PREDICT="${NUM_PREDICT:-8192}"
@@ -69,7 +72,12 @@ warn() { printf '%s[ WARN]%s %s\n' "$_c_yellow" "$_c_reset" "$*" >&2; }
 die()  { printf '%s[FATAL]%s %s\n' "$_c_red"    "$_c_reset" "$*" >&2; exit 1; }
 hdr()  { printf '\n%s=== %s ===%s\n' "$_c_bold" "$*" "$_c_reset"; }
 
-trap 'die "line $LINENO で失敗しました (exit=$?)"' ERR
+# bash の既知の罠: ERR トラップは `set +e` を敷いていても発火する（`set -e` の
+# 免除規則と同じ条件でしか止まらないだけで、trap 自体の発火は errexit の on/off と
+# 無関係）。そのため `set +e` で「失敗を握りつぶして最後に判定する」つもりのコードでも
+# 最初の失敗で die() が走ってしまっていた（30_cline_cli.sh など）。
+# $- を見て errexit が実際に有効なときだけ die する。
+trap 'if [[ $- == *e* ]]; then die "line $LINENO で失敗しました (exit=$?)"; fi' ERR
 
 # ---------------------------------------------------------------------------
 # ユーティリティ

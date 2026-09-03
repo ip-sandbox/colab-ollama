@@ -9,7 +9,7 @@
 #   !bash scripts/50_run.sh --json "TODO コメントを列挙して"                  # 機械可読出力
 #
 # 環境変数:
-#   AUTO_APPROVE=0   … 承認スキップを無効にする（既定は 1 = --yolo）
+#   AUTO_APPROVE=0   … 承認スキップを無効にする（既定は 1 = 全ツール自動承認）
 #   TASK_TIMEOUT=900 … タスク全体の上限秒数
 
 . "$(cd "$(dirname "$0")" && pwd)/common.sh"
@@ -19,6 +19,14 @@ AUTO_APPROVE="${AUTO_APPROVE:-1}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-900}"
 
 [ "$#" -ge 1 ] || die "使い方: bash scripts/50_run.sh [cline のオプション] \"やってほしいこと\""
+
+# ★重要: プロンプトは最後の引数として受け取り、標準入力経由で cline に渡す。
+# Cline CLI 3.x には日本語（マルチバイト文字を含む文字列全般）をコマンドライン
+# 引数として渡すと "Unknown command or unquoted prompt" で必ず失敗するバグがある
+# （実機で確認済み。ASCII のみのプロンプトは引数のままでも通る）。
+# 標準入力経由なら同じ文字列でも問題なく処理される。
+PROMPT="${*: -1}"
+EXTRA_ARGS=("${@:1:$#-1}")
 
 # --- 前提チェック（ここで弾くと原因が一目で分かる） ---------------------
 have cline || die "cline がありません。先に 30_cline_cli.sh を実行してください。"
@@ -38,20 +46,22 @@ if ! printf '%s' "$LOADED" | grep -q "$CLINE_MODEL"; then
 fi
 
 # --- 実行 ----------------------------------------------------------------
+# `--yolo` は CLI 3.x に無い（`cline --help` に存在しない）。
+# 全ツール自動承認は `--auto-approve <boolean>` で指定する（既定は true）。
 ARGS=(--cwd "$WORKSPACE" --timeout "$TASK_TIMEOUT")
-[ "$AUTO_APPROVE" = "1" ] && ARGS+=(--yolo)
+[ "$AUTO_APPROVE" = "1" ] && ARGS+=(--auto-approve true) || ARGS+=(--auto-approve false)
 
 hdr "Cline 実行"
 printf '    cwd     : %s\n' "$WORKSPACE"
 printf '    model   : %s (num_ctx=%s)\n' "$CLINE_MODEL" "$NUM_CTX"
 printf '    timeout : %ss\n' "$TASK_TIMEOUT"
-[ "$AUTO_APPROVE" = "1" ] && printf '    approve : --yolo（承認スキップ）\n' \
-                          || printf '    approve : 対話承認\n'
+[ "$AUTO_APPROVE" = "1" ] && printf '    approve : --auto-approve true（承認スキップ）\n' \
+                          || printf '    approve : --auto-approve false（対話承認。TTY が無いと固まるので注意）\n'
 echo
 
 cd "$WORKSPACE"
 set +e
-cline "${ARGS[@]}" "$@"
+printf '%s' "$PROMPT" | cline "${ARGS[@]}" "${EXTRA_ARGS[@]}"
 RC=$?
 set -e
 
