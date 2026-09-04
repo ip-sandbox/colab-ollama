@@ -55,7 +55,10 @@ ms=d.get("models") or []
 if not ms:
     print("      なし  <- 次のリクエストでロードが走り、その時間が Cline の 30 秒予算を食う")
 for m in ms:
-    print(f"      {m.get(\"name\")}  size_vram={m.get(\"size_vram\",0)/2**30:.1f}GiB  until={m.get(\"expires_at\",\"?\")}")
+    name = m.get("name")
+    size_vram = m.get("size_vram", 0) / 2**30
+    until = m.get("expires_at", "?")
+    print(f"      {name}  size_vram={size_vram:.1f}GiB  until={until}")
 '
 else
   echo "    Ollama が応答しないためスキップ"
