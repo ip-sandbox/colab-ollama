@@ -53,7 +53,8 @@ Colab VS Code 拡張の `Colab: Open Terminal`、または SSH）だけで進め
 cd /content && git clone https://github.com/ip-sandbox/colab-ollama.git colab-cline
 cd colab-cline
 bash scripts/00_setup_all.sh                       # 前提確認〜Ollama〜Cline CLI〜切り分けを一括実行
-# bash scripts/00_setup_all.sh --with-alt-agents    # 任意: Codex CLI / aider / Qwen Code も入れる
+# bash scripts/00_setup_all.sh --with-codex         # 任意: Codex CLI も入れる（--timeout を設定できる代替）
+# bash scripts/00_setup_all.sh --with-alt-agents    # 任意: Codex CLI / aider / Qwen Code を全部入れる
 # bash scripts/00_setup_all.sh --help
 ```
 

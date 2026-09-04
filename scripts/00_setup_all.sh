@@ -22,14 +22,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ensure_dirs
 
 WITH_ALT_AGENTS=""
+WITH_CODEX=0
 
 usage() {
   cat <<'EOF'
 使い方: bash scripts/00_setup_all.sh [オプション]
 
+  --with-codex
+        Cline CLI に加えて Codex CLI も導入し、ローカル Ollama を向ける
+        （既定では導入しない）。Codex は --timeout を設定できるため、
+        Cline CLI の 30 秒制限（手順書 §7）や、既定モデルでも起きうる
+        editor ツールの無限ループ（手順書 §5.7）を回避したい場合の代替になる。
   --with-alt-agents[=codex|aider|qwen|all]
         Cline CLI に加えて、タイムアウトを設定できる代替エージェントも導入する
-        （既定では導入しない）。値を省略すると all 扱い。
+        （既定では導入しない）。値を省略すると all 扱い。--with-codex と併用可
   -h, --help
         このヘルプを表示する
 
@@ -40,6 +46,7 @@ EOF
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --with-codex)             WITH_CODEX=1 ;;
     --with-alt-agents)       WITH_ALT_AGENTS="all" ;;
     --with-alt-agents=*)     WITH_ALT_AGENTS="${1#*=}" ;;
     -h|--help)                usage; exit 0 ;;
@@ -64,6 +71,15 @@ bash scripts/20_ollama.sh
 
 hdr "[3/5] Cline CLI の導入とローカル接続 (30_cline_cli.sh)"
 bash scripts/30_cline_cli.sh
+
+CODEX_INSTALLED=0
+if [ "$WITH_ALT_AGENTS" = "codex" ] || [ "$WITH_ALT_AGENTS" = "all" ]; then
+  CODEX_INSTALLED=1
+elif [ "$WITH_CODEX" -eq 1 ]; then
+  CODEX_INSTALLED=1
+  hdr "[3.5/5] Codex CLI の導入 (31_alt_agents.sh codex)"
+  bash scripts/31_alt_agents.sh codex
+fi
 
 if [ -n "$WITH_ALT_AGENTS" ]; then
   hdr "[3.5/5] 代替エージェントの導入 (31_alt_agents.sh $WITH_ALT_AGENTS)"
@@ -94,3 +110,15 @@ cat <<EOF
 
         cd $WORKSPACE && git add -A && git commit -m "wip" && git push
 EOF
+
+if [ "$CODEX_INSTALLED" -eq 1 ]; then
+  cat <<EOF
+
+    Codex CLI も導入済みです（--timeout を設定できるので、Cline CLI の
+    30 秒制限や editor ツールの無限ループ〈手順書 §5.7〉を避けたい場合に）:
+
+        cd $WORKSPACE
+        codex                                   # 対話 TUI
+        codex exec "fizzbuzz.py を作って実行して"  # 非対話
+EOF
+fi
