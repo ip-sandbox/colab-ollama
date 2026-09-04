@@ -134,8 +134,8 @@ Node 22 を入れて `npm i -g cline`、そのうえで **ローカルの Ollama
 
 > **注意:** Cline CLI は何も設定しないと「無料の Cline アカウント」を使います。
 > つまり Colab の T4 ではなくクラウドに投げます。
-> このセルの出力にある `cline config` の結果を **必ず目視で確認**してください。
-> 反映されていなければ、次のセルで対話設定します。
+> このセルの出力にある `providers.json` の内容を **必ず目視で確認**してください。
+> 反映されていなければ、次のセルで設定し直します。
 """
     ),
     code("!bash scripts/30_cline_cli.sh"),
@@ -143,17 +143,27 @@ Node 22 を入れて `npm i -g cline`、そのうえで **ローカルの Ollama
         """
 ### 設定が反映されていなかった場合
 
-`cline auth` は対話式なので、セルからは動きません。ターミナル（§5）で実行してください。
-ターミナルを使わない場合は、`cline config set` を直接叩きます。
+`cline auth`（引数なし・矢印キーで選択）は対話式なので、セルからは動きません。
+ターミナル（§5）で実行してください。
+ターミナルを使わない場合は、`cline auth` を引数付きで直接叩きます。
+
+**注意:** `cline config set key=value` は CLI 3.x で廃止されています
+（`error: too many arguments. Expected 1 argument but got 2.`）。
+`cline config`（引数なし）も対話専用の TUI になり、TTY が無いセルで実行すると
+制御シーケンスがそのまま出力され `interactive mode requires a TTY` で失敗します。
+どちらもセルからは使えません。
 """
     ),
     code(
         """
-# 個別に叩き直す例（キー名は CLI のバージョンで変わりうる）
-!cline config set act-mode-api-provider=ollama
-!cline config set act-mode-ollama-model-id=cline-coder
-!cline config set act-mode-ollama-base-url=http://127.0.0.1:11434
-!cline config
+# 個別に叩き直す例（キー名・サブコマンドは CLI のバージョンで変わりうる）
+!cline auth -p ollama -m cline-coder -k ollama
+
+# 反映されたかは providers.json を直接確認する（`cline config` は使えない）
+import json
+p = json.load(open("/root/.cline/data/settings/providers.json"))
+print("lastUsedProvider:", p.get("lastUsedProvider"))
+print("settings:", p.get("providers", {}).get(p.get("lastUsedProvider"), {}).get("settings"))
 """
     ),
     md(
