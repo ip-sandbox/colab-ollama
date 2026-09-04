@@ -108,17 +108,21 @@ GPU・VRAM・ディスク・Node・ターミナルの入手手段をまとめて
 
 モデルを変えたい場合は下の変数を書き換えてから実行します。
 
-| 空き VRAM | BASE_MODEL | NUM_CTX |
+| 用途 | BASE_MODEL | NUM_CTX |
 |---|---|---|
-| 13GB 以上 | `qwen2.5-coder:14b-instruct-q4_K_M` | 16384〜32768 |
-| 7〜13GB | `qwen2.5-coder:7b-instruct-q4_K_M`（既定） | 32768 |
-| prefill が遅すぎる | `qwen2.5-coder:3b-instruct-q4_K_M` | 16384 |
+| 既定（tool-calling 実績あり） | `qwen3:8b` | 32768 |
+| qwen2.5-coder 系を使う場合 | **手順書 §5.6 を読んでから。** 実タスクで完走するか要確認 |
+
+> **注意:** `qwen2.5-coder:7b-instruct-q4_K_M` は Ollama の tool-calling
+> プロトコルに従わず、Cline から `editor`/`run_commands` を一切呼び出せません
+> （コードをチャットに印字するだけでファイルは作られません）。
+> 実機で確認済みの既知の問題です。手順書 §5.6 を参照してください。
 """
     ),
     code(
         """
 import os
-os.environ["BASE_MODEL"]  = "qwen2.5-coder:7b-instruct-q4_K_M"
+os.environ["BASE_MODEL"]  = "qwen3:8b"
 os.environ["NUM_CTX"]     = "32768"
 os.environ["CLINE_MODEL"] = "cline-coder"
 
