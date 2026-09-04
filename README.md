@@ -38,10 +38,10 @@ T4 では速くなりません。ベンチ判定で選んでください。
    - 継続して使うなら `git clone` が結局いちばん楽（§3.4）
 
    ```bash
-   cd /content && git clone https://github.com/ip-sandbox/colab-ollma.git colab-cline
+   cd /content && git clone https://github.com/ip-sandbox/colab-ollama.git colab-cline
    ```
 
-   リポジトリ名は `colab-ollma`（`ollama` ではありません）。綴りを間違えると
+   リポジトリ名は `colab-ollama`、配置先は `colab-cline` で別物です。綴りを間違えると
    public でも 404 になり、git がパスワードを聞いてきます。
 3. [`notebooks/colab_cline.ipynb`](notebooks/colab_cline.ipynb) を開いて上から実行する
 

@@ -4,9 +4,9 @@
 import json
 import pathlib
 
-# 実在するリポジトリ名は colab-ollma（"ollama" ではなく "ollma"）。
+# リポジトリ名は colab-ollama、Colab 上の配置先は colab-cline で別物。
 # 綴りを間違えると public でも 404 になり、git がパスワードを聞いてくる。
-REPO = "https://github.com/ip-sandbox/colab-ollma.git"  # 自分の置き場に書き換える
+REPO = "https://github.com/ip-sandbox/colab-ollama.git"  # 自分の置き場に書き換える
 
 
 def md(src: str) -> dict:
@@ -53,7 +53,7 @@ Colab のノートブック UI だけで完結する AI コーディング環境
     code(
         f"""
 # --- 方法1: git から取得（推奨） ---
-# リポジトリ名 (colab-ollma) と配置先 (/content/colab-cline) は別物なので、
+# リポジトリ名 (colab-ollama) と配置先 (/content/colab-cline) は別物なので、
 # clone 先を明示している。手順書・スクリプトは /content/colab-cline を前提にしている。
 # !git clone {REPO} /content/colab-cline
 

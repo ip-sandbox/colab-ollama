@@ -98,24 +98,28 @@ curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
      -o "$STATEDIR/warmup.json"
 ok "ロード完了"
 
-hdr "6. prefill ベンチマーク（この構成でいちばん重要な数字）"
+hdr "6. 速度ベンチマーク（この構成でいちばん重要な数字）"
 # Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
 # VS Code 拡張と違い、CLI 側にタイムアウト設定が無い。
 # したがって「30 秒でプロンプトを何トークン処理できるか」が実用性の上限を決める。
 #
 # 長いプロンプトを実際に投げて prompt eval の速度を測り、
 # 30 秒で処理しきれるトークン数を逆算する。
-log "約 4000 トークンのプロンプトで prompt eval 速度を測ります"
-python3 - "$CLINE_MODEL" "$NUM_PREDICT" >"$STATEDIR/bench-req.json" <<'PY'
+log "長いプロンプト + 長めの生成で、prefill と generation の両方を測ります"
+# 生成速度も一緒に測る。エージェントはファイル 1 本を書き出すのに数百〜数千トークンを
+# 生成するので、「prefill は間に合ったが生成中に切られた」が現実に起きる。
+# 16 トークンで測ると誤差が大きすぎるので 256 トークン生成させる。
+# thinking モデル（qwen3 系）では、ここで測る eval_count に思考トークンも含まれる。
+python3 - "$CLINE_MODEL" >"$STATEDIR/bench-req.json" <<'PY'
 import json, sys
 # 圧縮の効きにくい擬似コードを並べてトークン数を稼ぐ（約 4000 tok を狙う）
 block = "def handler_%d(request, context):\n    payload = request.get('data', {})\n    return {'status': 200, 'body': payload}\n\n"
 body = "".join(block % i for i in range(340))
 print(json.dumps({
     "model": sys.argv[1],
-    "prompt": body + "\nHow many handler functions are defined above? Answer with a number only.",
+    "prompt": body + "\nWrite a detailed Python docstring for the handler functions above. Be verbose.",
     "stream": False,
-    "options": {"num_predict": 16},
+    "options": {"num_predict": 256},
 }))
 PY
 
@@ -149,13 +153,49 @@ print(f"      generation         : {ec} tok / {ed:.1f}s = {gen_tps:.1f} tok/s")
 print(f"      往復の実測          : {wall}s")
 print()
 
-# 生成にも時間がかかるので、予算の 7 割を prefill に充てられると仮定する
-usable = budget * 0.7
-safe_tokens = int(prefill_tps * usable)
+# 1 リクエストの所要 = prefill + generation。
+# エージェントは数百〜数千トークンを生成するので、生成分も予算を食う。
 print(f"      Cline CLI の 1 リクエスト予算 : {budget}s")
-print(f"      うち prefill に使える目安     : {usable:.0f}s")
+print(f"      所要 = プロンプト/{prefill_tps:.0f} + 出力/{gen_tps:.1f}")
+print()
+print("      予算内に収まる組み合わせ (O=収まる X=超える):")
+outs = [200, 500, 1000, 2000]
+print("        prompt \\ 出力 " + "".join(f"{o:>9}" for o in outs))
+for pp in (5000, 10000, 15000, 20000, 25000, 30000):
+    row = f"        {pp:>13,} "
+    for o in outs:
+        t = pp / prefill_tps + o / gen_tps if prefill_tps and gen_tps else 9e9
+        row += f"{('O' if t <= budget else 'X') + f'{t:4.0f}s':>9}"
+    print(row)
+print()
+
+# 「典型的な出力 500 トークン」を前提にした安全プロンプト長を主指標にする
+TYPICAL_OUT = 500
+gen_cost = TYPICAL_OUT / gen_tps if gen_tps else budget
+prefill_budget = max(budget - gen_cost, 0.0)
+safe_tokens = int(prefill_tps * prefill_budget)
+print(f"      出力 {TYPICAL_OUT} トークンを前提にすると:")
+print(f"        生成に      {gen_cost:.1f}s")
+print(f"        prefill に  {prefill_budget:.1f}s")
 print(f"      ★ 安全に投げられるプロンプト長 : 約 {safe_tokens:,} トークン")
 print()
+
+# --- thinking モデルの検出 --------------------------------------------
+# qwen3 系は既定で思考モードに入る。思考トークンは eval_count に載るが
+# 応答本文には出ないため、「生成が遅いのに答えが短い」形で予算を食う。
+# Modelfile では止められない（PARAMETER think は未サポート）ので、
+# ここでは実測して警告するだけにする。
+resp_text = r.get("response") or ""
+thinking = ("<think>" in resp_text) or ("</think>" in resp_text)
+visible = len(resp_text.replace("<think>", "").split("</think>")[-1])
+if thinking:
+    print("      ⚠ 思考トークン（<think>）を検出しました。")
+    print(f"        生成 {ec} トークンのうち、応答本文は約 {visible} 文字ぶんです。")
+    print("        思考ぶんも 30 秒予算を食います。Modelfile では止められません")
+    print("        （PARAMETER think は未サポート / SYSTEM /no_think は")
+    print("         クライアントの system prompt に上書きされる）。")
+    print("        遅いと感じたら think 非対応の小型モデルに替えてください。")
+    print()
 
 if safe_tokens >= num_ctx:
     verdict = "OK"
@@ -181,9 +221,16 @@ print(f"      判定: {verdict}")
 print(f"      {msg}")
 
 # 後続スクリプトが読めるように書き出す
+if gen_tps and (2000 / gen_tps) > budget:
+    print()
+    print(f"      ⚠ 生成 {gen_tps:.1f} tok/s だと、出力 2000 トークン（ファイル1本の書き出し）だけで")
+    print(f"        {2000/gen_tps:.0f}s かかります。プロンプトが短くてもここで切られます。")
+    print("        → 1ファイルまるごと書かせず、部分置換で編集させてください。")
+
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({"prefill_tps": prefill_tps, "gen_tps": gen_tps,
-               "safe_prompt_tokens": safe_tokens, "verdict": verdict}, f)
+               "safe_prompt_tokens": safe_tokens, "verdict": verdict,
+               "typical_out_tokens": TYPICAL_OUT, "thinking_detected": thinking}, f)
 PY
 
 hdr "7. VRAM 実測"
