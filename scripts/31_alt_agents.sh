@@ -210,7 +210,7 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
 # 生成: scripts/31_alt_agents.sh
 
 model = "$CLINE_MODEL"
-model_provider = "ollama"
+model_provider = "ollama-local"
 
 # Codex は 32k 以上、できれば 64k のコンテキストを想定している。
 # T4 では 7B + 32k が現実的な上限（手順書 §5.3）。
@@ -225,7 +225,7 @@ model_max_output_tokens = $NUM_PREDICT
 sandbox_mode = "danger-full-access"
 approval_policy = "never"
 
-[model_providers.ollama]
+[model_providers.ollama-local]
 name = "Ollama (local)"
 base_url = "$OLLAMA_BASE_URL/v1"
 wire_api = "$WIRE_API"
