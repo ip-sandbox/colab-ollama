@@ -182,20 +182,43 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
        （qwen2.5-coder 系は対応しています。ベースモデルを変えた場合は要確認）"
   fi
 
-  # --- wire_api の判定 --------------------------------------------------
-  # Ollama 0.13.3 以降は /v1/responses を出す。それ以前は /v1/chat/completions のみ。
-  # Codex はどちらも喋れるので、実際に生えているほうに合わせる。
-  log "Ollama がどのエンドポイントを出しているか調べます"
-  RESP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-      -X POST "$OLLAMA_BASE_URL/v1/responses" \
-      -H 'Content-Type: application/json' \
-      -d "{\"model\":\"$CLINE_MODEL\",\"input\":\"hi\",\"max_output_tokens\":16}" 2>/dev/null || echo 000)"
-  if [ "$RESP_CODE" = "404" ] || [ "$RESP_CODE" = "000" ]; then
+  # --- ツール呼び出し修復プロキシ ----------------------------------------
+  # qwen2.5-coder 系は Ollama の <tool_call> ラッパー要求に従わず、ツール呼び出しの
+  # JSON をプレーンテキストで返すことがある（手順書 §5.6・§5.8、openai/codex#2229）。
+  # CODEX_TOOL_REPAIR=1（既定）なら修復プロキシを挟み、Codex はそちらを向く。
+  CODEX_BASE_URL="$OLLAMA_BASE_URL"
+  if [ "$CODEX_TOOL_REPAIR" = "1" ]; then
+    hdr "3.1 ツール呼び出し修復プロキシ"
+    warn "CODEX_TOOL_REPAIR=1: qwen2.5-coder 系の既知の不具合
+       （tool_calls ではなく content に生 JSON が落ちる）に備え、
+       修復プロキシ (scripts/32_codex_tool_proxy.py) を経由させます。
+       壊れていないモデルには無害（そのまま通す）ですが、ストリーミング表示は
+       1チャンクにまとめられます。CODEX_TOOL_REPAIR=0 で無効化できます。"
+    PROXY_LOG="$LOGDIR/codex-tool-proxy.log"
+    start_bg codex-tool-proxy "$PROXY_LOG" \
+      python3 "$(cd "$(dirname "$0")" && pwd)/32_codex_tool_proxy.py"
+    wait_http "$CODEX_PROXY_BASE_URL/v1/models" 30 "codex-tool-proxy" \
+      || die "修復プロキシが起動しませんでした。ログ: $PROXY_LOG"
+    CODEX_BASE_URL="$CODEX_PROXY_BASE_URL"
+    # プロキシは /v1/chat/completions のみ実装しているため wire_api は固定する。
     WIRE_API="chat"
-    log "/v1/responses は使えません (HTTP $RESP_CODE) -> wire_api = \"chat\""
+    ok "修復プロキシ経由にします: $CODEX_BASE_URL (wire_api=$WIRE_API 固定)"
   else
-    WIRE_API="responses"
-    ok "/v1/responses が応答しました (HTTP $RESP_CODE) -> wire_api = \"responses\""
+    # --- wire_api の判定 --------------------------------------------------
+    # Ollama 0.13.3 以降は /v1/responses を出す。それ以前は /v1/chat/completions のみ。
+    # Codex はどちらも喋れるので、実際に生えているほうに合わせる。
+    log "Ollama がどのエンドポイントを出しているか調べます"
+    RESP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -X POST "$OLLAMA_BASE_URL/v1/responses" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$CLINE_MODEL\",\"input\":\"hi\",\"max_output_tokens\":16}" 2>/dev/null || echo 000)"
+    if [ "$RESP_CODE" = "404" ] || [ "$RESP_CODE" = "000" ]; then
+      WIRE_API="chat"
+      log "/v1/responses は使えません (HTTP $RESP_CODE) -> wire_api = \"chat\""
+    else
+      WIRE_API="responses"
+      ok "/v1/responses が応答しました (HTTP $RESP_CODE) -> wire_api = \"responses\""
+    fi
   fi
 
   # --- config.toml ------------------------------------------------------
@@ -227,7 +250,7 @@ approval_policy = "never"
 
 [model_providers.ollama-local]
 name = "Ollama (local)"
-base_url = "$OLLAMA_BASE_URL/v1"
+base_url = "$CODEX_BASE_URL/v1"
 wire_api = "$WIRE_API"
 
 # ★ ここが Cline CLI に無い設定。
@@ -251,6 +274,10 @@ EOF
       - Codex は git リポジトリ内で動かすことを想定しています
         （$WORKSPACE は 30_cline_cli.sh が git init 済み）
       - サンドボックスを無効にしています。Colab の使い捨て VM 前提の設定です
+      - codex --oss -m $CLINE_MODEL は config.toml を使わず直接 Ollama を指すため、
+        ツール呼び出し修復プロキシを経由しません（CODEX_TOOL_REPAIR=1 の効果が
+        及ぶのは通常の \`codex\` / \`codex exec\` のみ）
+$([ "$CODEX_TOOL_REPAIR" = "1" ] && printf '      - 修復プロキシのログ: %s\n' "$PROXY_LOG")
 
 EOF
 fi

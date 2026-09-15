@@ -45,6 +45,18 @@ export NUM_PREDICT="${NUM_PREDICT:-8192}"
 export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-30}"
 
 # ---------------------------------------------------------------------------
+# Codex CLI 用ツール呼び出し修復プロキシ（手順書 §5.8）
+# ---------------------------------------------------------------------------
+# qwen2.5-coder 系は Ollama の <tool_call> ラッパー要求に従わず、ツール呼び出しの
+# JSON を message.content にプレーンテキストで返すことがある（§5.6 と同根、
+# openai/codex#2229）。CODEX_TOOL_REPAIR=1（既定）のとき、31_alt_agents.sh は
+# scripts/32_codex_tool_proxy.py を Codex と Ollama の間に起動し、Codex の
+# config.toml をこのプロキシへ向ける。0 にすると旧来どおり Ollama に直結する。
+export CODEX_TOOL_REPAIR="${CODEX_TOOL_REPAIR:-1}"
+export CODEX_PROXY_PORT="${CODEX_PROXY_PORT:-11435}"
+export CODEX_PROXY_BASE_URL="${CODEX_PROXY_BASE_URL:-http://127.0.0.1:$CODEX_PROXY_PORT}"
+
+# ---------------------------------------------------------------------------
 # Cline CLI
 # ---------------------------------------------------------------------------
 export NODE_MAJOR="${NODE_MAJOR:-22}"

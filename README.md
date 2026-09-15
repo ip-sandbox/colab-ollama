@@ -102,6 +102,8 @@ scripts/00_setup_all.sh        ノートブック無しで一括実行するラ�
 scripts/10_preflight.sh        GPU/VRAM/ディスク/Node/ターミナル手段の確認
 scripts/20_ollama.sh           Ollama + モデル + num_ctx + prefill ベンチ
 scripts/30_cline_cli.sh        Node 22 + Cline CLI + ローカル接続設定
+scripts/31_alt_agents.sh       任意: Codex CLI / aider / Qwen Code
+scripts/32_codex_tool_proxy.py Codex 用ツール呼び出し修復プロキシ（手順書 §5.8）
 scripts/40_terminal_setup.sh   ターミナル用の ~/.bashrc 整備
 scripts/50_run.sh              セルから Cline を走らせるラッパ
 scripts/90_healthcheck.sh      切り分け + 30 秒予算の実測
@@ -119,3 +121,7 @@ CLINE_PROVIDER=openai-compatible bash scripts/30_cline_cli.sh   # 30秒制限の
 `BASE_MODEL` を qwen2.5-coder 系に戻す場合は、Cline が実際にファイルを書けるか
 （チャットで説明するだけで終わっていないか）を必ず実タスクで確認してください。
 手順書 §5.6 を参照。
+
+Codex CLI で qwen2.5-coder 系（例: `14b-instruct-q4_K_M`）を使う場合、
+`--with-codex` は既定でツール呼び出し修復プロキシ（`CODEX_TOOL_REPAIR=1`）を
+経由させます。手順書 §5.8 を参照。

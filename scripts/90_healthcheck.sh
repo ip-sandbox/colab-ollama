@@ -25,10 +25,21 @@ for name in ollama; do
     printf '    %s[DOWN]%s %s  -> bash scripts/20_ollama.sh\n' "$_c_yellow" "$_c_reset" "$name"
   fi
 done
+if [ "$CODEX_TOOL_REPAIR" = "1" ]; then
+  pidfile="$STATEDIR/codex-tool-proxy.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    printf '    %s[  UP]%s %s\n' "$_c_green" "$_c_reset" "codex-tool-proxy"
+  else
+    printf '    %s[DOWN]%s %s  -> bash scripts/31_alt_agents.sh codex\n' "$_c_yellow" "$_c_reset" "codex-tool-proxy"
+  fi
+fi
 
 hdr "エンドポイント"
 check "Ollama    $OLLAMA_BASE_URL/api/tags"  curl -fsS --max-time 5 "$OLLAMA_BASE_URL/api/tags"
 check "OpenAI互換 $OLLAMA_BASE_URL/v1/models" curl -fsS --max-time 5 "$OLLAMA_BASE_URL/v1/models"
+if [ "$CODEX_TOOL_REPAIR" = "1" ]; then
+  check "修復プロキシ $CODEX_PROXY_BASE_URL/v1/models" curl -fsS --max-time 5 "$CODEX_PROXY_BASE_URL/v1/models"
+fi
 
 hdr "モデル"
 if curl -fsS --max-time 5 "$OLLAMA_BASE_URL/api/tags" >/dev/null 2>&1; then
