@@ -157,6 +157,53 @@ codex
 - 変更: `docs/手順書.md`（§5.8 新設、§7.1 の `wire_api` 記述を実態に合わせて修正）
 - 変更: `README.md`（一行追記）
 
+## 追記: 後片付けスクリプト (`scripts/99_teardown.sh`) の動作確認とバグ修正
+
+「プロキシなどの停止方法はあるか」という質問を受け、既存の
+`bash scripts/99_teardown.sh --all`（ollama と codex-tool-proxy を両方
+`stop_bg` で止める設計）を実機で実行して確認したところ、
+
+```
+/content/colab-ollama/scripts/common.sh: line 193: name: unbound variable
+```
+
+で失敗した。原因は `scripts/common.sh` の `stop_bg()` が
+
+```bash
+local name="$1" pidfile="$STATEDIR/$name.pid" pid
+```
+
+と 1 つの `local` 文で `name` と `pidfile` を同時に宣言していたこと。
+bash は `local` の右辺をコマンドライン全体として先に展開してから代入するため、
+`$STATEDIR/$name.pid` の `$name` は同じ文で後から定義される `name` ではなく
+呼び出し元スコープの（未定義の）`name` を参照してしまい、`set -u` の下で
+`unbound variable` になる。すぐ上の `start_bg()` は `local name=... ; local
+pidfile=...` と 2 文に分けており同じ問題を踏んでいない。
+
+このバグは今回の Codex プロキシ対応以前から存在していた（`99_teardown.sh` は
+以前から `stop_bg ollama` を呼んでいた）が、実機で `--all`/`--purge` を
+伴う teardown を初めて実行したことで顕在化した。
+
+`stop_bg()` を `start_bg()` と同じパターン（`local name="$1"` を独立した
+`local` 文にする）に直し、再度 `bash scripts/99_teardown.sh --all` を実行して
+以下を確認した:
+
+```
+=== Ollama の停止 ===
+[   OK] ollama を停止しました (pid=9350)
+
+=== ツール呼び出し修復プロキシの停止 ===
+[   OK] codex-tool-proxy を停止しました (pid=17848)
+
+=== 現在の状態 ===
+[DOWN] ollama
+[DOWN] codex-tool-proxy
+```
+
+`pgrep -af 'ollama serve|codex_tool_proxy'` でプロセスが実際に残っていない
+ことも確認済み。新しい後片付けスクリプトを追加する必要は無く、既存の
+`scripts/99_teardown.sh --all` がそのまま使える。
+
 ## 結論
 
 - `CODEX_TOOL_REPAIR=1`（既定）で `qwen2.5-coder:14b-instruct-q4_K_M` を

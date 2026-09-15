@@ -190,7 +190,8 @@ start_bg() {
 }
 
 stop_bg() {
-  local name="$1" pidfile="$STATEDIR/$name.pid" pid
+  local name="$1"
+  local pidfile="$STATEDIR/$name.pid" pid
   [ -f "$pidfile" ] || { log "$name は起動していません"; return 0; }
   pid="$(cat "$pidfile")"
   if kill -0 "$pid" 2>/dev/null; then
