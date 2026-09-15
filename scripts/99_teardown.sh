@@ -32,6 +32,9 @@ if [ "$MODE" = "--all" ] || [ "$MODE" = "--purge" ]; then
   hdr "Ollama の停止"
   stop_bg ollama
   pkill -x ollama 2>/dev/null && ok "残存 ollama を停止しました"
+
+  hdr "ツール呼び出し修復プロキシの停止"
+  stop_bg codex-tool-proxy
 fi
 
 if [ "$MODE" = "--purge" ]; then
@@ -44,10 +47,15 @@ if [ "$MODE" = "--purge" ]; then
 fi
 
 hdr "現在の状態"
-for name in ollama; do
-  pgrep -x "$name" >/dev/null 2>&1 \
-    && printf '    %s[  UP]%s %s\n' "$_c_yellow" "$_c_reset" "$name" \
-    || printf '    %s[DOWN]%s %s\n' "$_c_green"  "$_c_reset" "$name"
+# codex-tool-proxy は python3 プロセスなので実行ファイル名では判別できない。
+# pidfile を優先し、無ければ (ollama のような) 実行ファイル名で見る。
+for name in ollama codex-tool-proxy; do
+  pidfile="$STATEDIR/$name.pid"
+  if { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; } || pgrep -x "$name" >/dev/null 2>&1; then
+    printf '    %s[  UP]%s %s\n' "$_c_yellow" "$_c_reset" "$name"
+  else
+    printf '    %s[DOWN]%s %s\n' "$_c_green"  "$_c_reset" "$name"
+  fi
 done
 
 echo
