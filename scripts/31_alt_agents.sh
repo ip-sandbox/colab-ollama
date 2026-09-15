@@ -200,8 +200,10 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "codex" ]; then
     wait_http "$CODEX_PROXY_BASE_URL/v1/models" 30 "codex-tool-proxy" \
       || die "修復プロキシが起動しませんでした。ログ: $PROXY_LOG"
     CODEX_BASE_URL="$CODEX_PROXY_BASE_URL"
-    # プロキシは /v1/chat/completions のみ実装しているため wire_api は固定する。
-    WIRE_API="chat"
+    # Codex CLI 0.15x 系は wire_api="chat" を廃止し /v1/responses のみ対応
+    # ("wire_api = \"chat\" is no longer supported" で起動失敗する)。
+    # プロキシは /v1/responses を実装しているのでこちらに固定する。
+    WIRE_API="responses"
     ok "修復プロキシ経由にします: $CODEX_BASE_URL (wire_api=$WIRE_API 固定)"
   else
     # --- wire_api の判定 --------------------------------------------------
