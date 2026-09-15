@@ -125,3 +125,18 @@ CLINE_PROVIDER=openai-compatible bash scripts/30_cline_cli.sh   # 30秒制限の
 Codex CLI で qwen2.5-coder 系（例: `14b-instruct-q4_K_M`）を使う場合、
 `--with-codex` は既定でツール呼び出し修復プロキシ（`CODEX_TOOL_REPAIR=1`）を
 経由させます。手順書 §5.8 を参照。
+
+```bash
+BASE_MODEL=qwen2.5-coder:14b-instruct-q4_K_M NUM_CTX=16384 \
+  bash scripts/00_setup_all.sh --with-codex
+```
+
+これを実行しても、Codex CLI の起動画面や `/model` の選択肢に
+`qwen2.5-coder:14b-instruct-q4_K_M` という名前はそのまま出てきません。
+`20_ollama.sh` が `BASE_MODEL` を土台に `num_ctx`/`num_predict` などを
+焼き込んだラッパーモデル **`$CLINE_MODEL`（既定 `cline-coder`）** を
+`ollama create` で作り、`~/.codex/config.toml` の `model = "$CLINE_MODEL"`
+もこの名前を指すからです。**Codex で選ぶべきモデル名は常に `cline-coder`
+（`CLINE_MODEL` を上書きした場合はその値）** で、`BASE_MODEL` を変えても
+Codex 側の表示名は変わりません。`ollama show cline-coder` で実体
+（`FROM qwen2.5-coder:14b-instruct-q4_K_M` など）を確認できます。
