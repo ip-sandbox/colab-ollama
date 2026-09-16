@@ -140,3 +140,10 @@ BASE_MODEL=qwen2.5-coder:14b-instruct-q4_K_M NUM_CTX=16384 \
 （`CLINE_MODEL` を上書きした場合はその値）** で、`BASE_MODEL` を変えても
 Codex 側の表示名は変わりません。`ollama show cline-coder` で実体
 （`FROM qwen2.5-coder:14b-instruct-q4_K_M` など）を確認できます。
+
+qwen2.5-coder はさらに、`apply_patch` の diff 形式を安定して組み立てられず
+「〜します」と宣言だけして何も書かない・中身が空のファイルを作る、という
+不具合もあります（手順書 §5.8.1）。`--with-codex` は対策として
+`$WORKSPACE/AGENTS.md` に運用ルール（heredoc でファイル全体を書き直す・
+先に宣言せずツールを呼ぶ・書いたら自分で確認する、など）を自動配置します。
+毎回プロンプトで注意書きを書く必要はありません。詳細は手順書 §5.9。
