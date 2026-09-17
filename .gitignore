@@ -5,3 +5,7 @@ __pycache__/
 logs/
 workspace/
 .cline-env/
+
+# 手元側のリモート制御で生成されるもの
+remote/.ssh_config
+artifacts/

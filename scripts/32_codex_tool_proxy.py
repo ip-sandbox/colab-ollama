@@ -33,6 +33,25 @@ UPSTREAM = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/
 LISTEN_PORT = int(os.environ.get("CODEX_PROXY_PORT", "11435"))
 
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+# --- gpt-oss + Ollama のツール呼び出しパース失敗への再送 ---------------------
+# ollama/ollama#17638（2026-08-09 報告・未修正。手元の 0.34.1 でも再現）:
+#   gpt-oss の出力が array-wrap になり、開き括弧が無いまま末尾に ] だけ残る。
+#       {"cmd":"apply_patch <<'PATCH' ... PATCH"]}
+#   Ollama は自分で生成させた出力を自分でパースできず HTTP 500 を返す。
+#       error parsing tool call: raw='...', err=invalid character ']' ...
+#
+# 発生条件は「単一のフリーフォーム文字列引数を取る patch 系ツール」「長いツール
+# 説明文」「複数ターン」で、**非決定的**（報告ではおおむね 5 回中 2 回）。
+#
+# 原因は上流にあり、このプロキシからは生のテキストが見えない（Ollama の内部で
+# 落ちて 500 になるため、修復のしようがない）。だが非決定的なので、
+# **同じリクエストを投げ直せば通る見込みが高い**。温度 0.2 でサンプリングして
+# いるので再送のたびに出力は変わる。
+#
+# これは対症療法である。上流が直れば不要になる。
+_TOOL_PARSE_ERR_RE = re.compile(r"error parsing tool call", re.IGNORECASE)
+TOOLCALL_RETRIES = int(os.environ.get("CODEX_PROXY_TOOLCALL_RETRIES", "3"))
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 _id_counter = itertools.count()
@@ -278,6 +297,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # pragma: no cover - network failure path
             self._send_json(502, {"error": {"message": str(e)}})
 
+    def _post_upstream(self, path: str, data: bytes):
+        """上流へ POST し、パース済み body を返す。
+
+        ollama/ollama#17638（gpt-oss のツール呼び出しが array-wrap になり
+        Ollama 自身がパースに失敗して 500 を返す）は**非決定的**なので、
+        その 500 に限って投げ直す。それ以外のエラーはそのまま客に返す。
+
+        失敗して応答を送信済みの場合は None を返す。
+        """
+        last_err_body = b""
+        for attempt in range(1, TOOLCALL_RETRIES + 2):
+            try:
+                req = urllib.request.Request(
+                    f"{UPSTREAM}{path}", data=data, method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read()
+                # 再送して意味があるのは、上流がツール呼び出しのパースに
+                # 失敗したときだけ。400 などを投げ直しても同じ結果になる。
+                if e.code >= 500 and _TOOL_PARSE_ERR_RE.search(
+                    body.decode("utf-8", "replace")
+                ):
+                    last_err_body = body
+                    if attempt <= TOOLCALL_RETRIES:
+                        _log(f"upstream {e.code} error parsing tool call "
+                             f"(ollama#17638) — 再送します "
+                             f"({attempt}/{TOOLCALL_RETRIES})")
+                        continue
+                    _log(f"upstream {e.code} error parsing tool call — "
+                         f"{TOOLCALL_RETRIES} 回再送しても直りませんでした")
+                    self._send_bytes(e.code, "application/json", last_err_body)
+                    return None
+                self._send_bytes(e.code, "application/json", body)
+                return None
+            except Exception as e:
+                self._send_json(502, {"error": {"message": str(e)}})
+                return None
+        return None
+
     def do_GET(self):
         self._proxy_passthrough("GET", self.path, b"")
 
@@ -311,19 +372,9 @@ class Handler(BaseHTTPRequestHandler):
             valid_tool_names.discard(None)
 
         upstream_data = json.dumps(req_body).encode("utf-8")
-        try:
-            up_req = urllib.request.Request(
-                f"{UPSTREAM}{path}", data=upstream_data, method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(up_req, timeout=600) as resp:
-                resp_body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            self._send_bytes(e.code, "application/json", e.read())
-            return
-        except Exception as e:
-            self._send_json(502, {"error": {"message": str(e)}})
-            return
+        resp_body = self._post_upstream(path, upstream_data)
+        if resp_body is None:
+            return  # エラー応答は _post_upstream が送信済み
 
         if path == "/v1/responses":
             repaired = _repair_responses_body(resp_body, valid_tool_names)

@@ -214,3 +214,116 @@ pidfile=...` と 2 文に分けており同じ問題を踏んでいない。
 - 修復プロキシはツール呼び出しの **形式** の問題を解決するものであり、
   14B モデル自身の tool-calling **信頼性**（ツール名・引数の正確性）は
   別問題として残ることを実機で確認・記録した。
+
+---
+
+# 追記 (2026-09-17): colab CLI によるリモート制御と gpt-oss:20b の実測
+
+計画: [`docs/リモート化計画.md`](docs/リモート化計画.md) / 手順: 手順書 §12
+
+## 環境
+
+- 手元: Ubuntu / colab CLI **0.7.1**（git から導入。PyPI は 0.6.0 止まりで `colab ssh` が無い）
+- VM: Colab 無料枠 **Tesla T4** (15360 MiB, 空き 14913 MiB), driver 580.82.07
+- Python 3.13.15 / RAM 12GB / disk 113GB
+
+## 1. 経路: `colab ssh` は使えた
+
+`colab ssh` は **v0.7.0 (2026-09-03) で追加**されたが **PyPI には 0.6.0 までしか
+出ていない**（2026-09-17 時点。git tag は v0.7.1）。git から入れれば使える。
+
+`--proxy-mode` が OpenSSH の `ProxyCommand` 互換なので、生成した `.ssh_config`
+経由で `ssh` / `scp` / `tar | ssh` がそのまま通ることを実機で確認した。
+0.6.0 前提で必要だった「`colab exec` に Python を渡して `subprocess` でシェルを
+回す」「既定 30 秒の timeout を避けるためデタッチしてログをポーリングする」
+という迂回は**すべて不要になった**。
+
+## 2. ★最大の落とし穴: SSH では Ollama が黙って CPU に落ちる
+
+Colab のノートブックカーネルは `LD_LIBRARY_PATH=/usr/lib64-nvidia` を設定するが、
+**素の SSH ログインには引き継がれない**。`/dev/nvidia0` は見えているのに:
+
+```
+NVIDIA-SMI couldn't find libnvidia-ml.so library in your system
+```
+
+**問題は `nvidia-smi` が落ちることではない。Ollama が CUDA を検出できず、
+エラーも出さずに CPU へフォールバックすること。** 気付かなければ推論が一桁遅くなり、
+ベンチの数字が丸ごと無意味になっていた。
+
+環境変数ではなく **ldconfig で直す**（Ollama をどう起動しても効かせるため）:
+
+```bash
+echo /usr/lib64-nvidia > /etc/ld.so.conf.d/colab-nvidia.conf && ldconfig
+```
+
+`remote/common.sh` の `vm_bootstrap_env()` が `01_new.sh` から自動実行する。
+効いていることの確認は `ollama.log` のこの行:
+
+```
+msg="inference compute" library=CUDA compute=7.5 name=CUDA0 description="Tesla T4"
+```
+
+他に踏んだ罠は手順書 §12.5 に記録した
+（`A && B & echo $!` の `&` の係り方、`pgrep -f` の ssh 越し自己マッチ）。
+
+## 3. ★gpt-oss:20b は T4 で動き、qwen3:8b より速い
+
+**当初の懸念（MXFP4 が sm_75 / Turing で成立するか）は杞憂だった。**
+
+```
+llama_model_loader: - type mxfp4:   72 tensors
+load_tensors: offloaded 25/25 layers to GPU
+ollama ps -> PROCESSOR: 100% GPU
+```
+
+CPU オフロードは一切無し。num_ctx=16384 で VRAM 使用 12499 MiB / 空き 2414 MiB。
+
+### ベンチ比較（同一 VM・同一条件）
+
+| | qwen3:8b (ctx 32768) | **gpt-oss:20b (ctx 16384)** |
+|---|---:|---:|
+| prefill | 956 tok/s | 880 tok/s |
+| generation | 23.6 tok/s | **34.5 tok/s** |
+| 安全プロンプト長 | 8,410 tok | **13,645 tok** |
+| 判定 | WARN | **OK** |
+| VRAM | 7,501 MiB | 12,499 MiB |
+
+**20B なのに 8B より生成が 1.46 倍速い。** MoE（活性 3.6B）なので当然ではあるが、
+T4 のような狭い環境ではこの差がそのままエージェントの実用性に効く。
+
+### 実タスク E-1（fizzbuzz を作って実行）: 完走
+
+`codex exec` で 1 発完走。qwen2.5-coder:14b で繰り返し起きていた
+「宣言だけして何も書かない」「コマンドを提示してユーザーに実行を頼む」
+（§5.8.1 および 2026-09-16 の追試）は**再現しなかった**。
+
+- 中身のある `fizzbuzz.py` (324 bytes) を実際に書いた
+- **`ls -la fizzbuzz.py && cat fizzbuzz.py` で自己確認した**（AGENTS.md の指示に従っている）
+- `python3 fizzbuzz.py` を自分で実行し、出力を報告した
+- 報告は日本語。中国語への切り替わりも無し
+
+修復プロキシは**経由していない**（`base_url = http://127.0.0.1:11434/v1` 直結）。
+`MODEL_PROFILE=gpt-oss-20b` が `CODEX_TOOL_REPAIR=0` を設定するため。
+
+## 4. VRAM 事前チェックの精度
+
+`scripts/vram_precheck.py` はレジストリのマニフェストだけで判定する（pull 不要）。
+
+| モデル | 事前チェックの予測 | 実測 | 判定 |
+|---|---:|---:|:--:|
+| gpt-oss:20b | 必要 14,188 MiB / 余裕 +725 | 使用 12,499 MiB / 空き 2,414 | OK（安全側に外した） |
+| devstral-small-2:24b-q4_K_M | 必要 16,392 MiB / 余裕 **-1,479** | （pull せず） | **NG** |
+
+予測は安全側に 1.7GB ほど過大だった（マニフェストの重みサイズには VRAM に
+載らない分も含まれる、KV も実測 0.013 MiB/token に対し 0.024 で見積もった）。
+**過大評価は「載るものを弾く」方向に効くので、閾値は今後ゆるめる余地がある。**
+Devstral は 1.5GB の不足で、過大評価を割り引いても載らない。
+
+## 5. 結論
+
+- **リモート制御の足場は完成し、実機で一通り通した**
+  （`00_doctor` → `01_new` → `02_deploy` → `03_setup` → `04_attach` → `09_stop`）
+- **評価対象の第一候補 `gpt-oss:20b` は T4 で成立し、現行既定 qwen3:8b より速い。**
+  実タスクのツール呼び出しも安定していた
+- 残: `qwen3:14b` の測定、評価ハーネス `scripts/60_eval.sh`（E-2〜E-4）の実装

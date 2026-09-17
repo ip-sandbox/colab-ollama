@@ -6,13 +6,16 @@ Colab のノートブック UI の中から AI コーディングをするため
 **外部トンネルも公開 URL も使いません。** すべて VM の中で完結します。
 
 ```
-ブラウザ（Colab ノートブック UI）
-  ├ ターミナルウィンドウ  cline              ← 本命。全ユーザー無料（2025-06-23〜）
-  └ セルから直接        !bash scripts/50_run.sh "..."   ← 自動化向け
-        │
-        └ Colab VM (T4 16GB)
-            ├ Ollama 127.0.0.1:11434  (7B Q4_K_M / num_ctx=32768)
-            └ Cline CLI  ──> /content/workspace
+手元のシェル                              ブラウザ（Colab ノートブック UI）
+  └ remote/*.sh                             ├ ターミナルウィンドウ  cline
+     （colab CLI + ssh）                     └ セルから  !bash scripts/50_run.sh "..."
+        │                                        │
+        └────────────┬───────────────────────────┘
+                     │
+                  Colab VM (T4 16GB)
+                     ├ Ollama 127.0.0.1:11434  (num_ctx はモデル依存)
+                     ├ Cline CLI  ──> /content/workspace
+                     └ Codex CLI  ──> /content/workspace
 ```
 
 ## まず読むもの
@@ -74,6 +77,59 @@ bash scripts/90_healthcheck.sh                     # 切り分け
 あとはノートブック下部の**「ターミナル」ボタン**を開いて `cline` を叩くだけです。
 Colab VS Code 拡張の `Colab: Open Terminal` でも同じ VM のシェルが取れます。
 
+## 手元のシェルから操作する（リモート制御）
+
+ノートブックを開かず、**手元から VM を立てて操作する**経路もあります。
+モデルを差し替えて何度も評価を回すならこちらが速いです。
+
+**→ 手順は [`docs/リモート運用ガイド.md`](docs/リモート運用ガイド.md) を見てください。**
+準備から Codex で使うところまで、この 1 本で通せます。
+設計の背景は [`docs/手順書.md` §12](docs/手順書.md)、検討の経緯は
+[`docs/リモート化計画.md`](docs/リモート化計画.md)。
+
+**`colab ssh` を使うので、colab CLI は git から入れてください。**
+v0.7.0 で追加された機能ですが、PyPI には 0.6.0 までしか出ていません（2026-09-17 時点）。
+
+```bash
+uv tool install --force "git+https://github.com/googlecolab/google-colab-cli@v0.7.1"
+```
+
+```bash
+bash remote/00_doctor.sh     # 手元側の前提確認（VM は作らない＝課金しない）
+bash remote/01_new.sh        # VM 確保 + ssh 経路の検証
+bash remote/02_deploy.sh     # 作業ツリーを VM へ同期
+bash remote/03_setup.sh      # Ollama + Cline + Codex（10〜20 分）
+bash remote/04_attach.sh codex   # codex TUI に入る
+bash remote/09_stop.sh       # ★成果物を回収して停止
+```
+
+`--proxy-mode` が OpenSSH の `ProxyCommand` 互換なので、生成される
+`remote/.ssh_config` を使えば `ssh` / `scp` / VS Code Remote-SSH もそのまま通ります。
+
+**停止忘れが最大のリスクです。** `colab stop` しない限りキープアライブが
+24 時間回り続けます。`09_stop.sh` は停止前に成果物を `artifacts/` に回収します。
+
+### モデルの差し替え
+
+`MODEL_PROFILE` 1 つで `BASE_MODEL` / `NUM_CTX` / 修復プロキシ / `AGENTS.md` の
+中身がまとめて切り替わります（未指定なら従来どおりの挙動）。
+
+```bash
+MODEL_PROFILE=gpt-oss-20b bash remote/03_setup.sh
+```
+
+| プロファイル | モデル | T4 (14.5GiB 空き) |
+|---|---|:--:|
+| `qwen3-8b` | `qwen3:8b`（現行既定） | ◎ |
+| `qwen3-14b` | `qwen3:14b` | ◎ |
+| `gpt-oss-20b` | `gpt-oss:20b`（MXFP4 MoE） | ○ 余裕 +725MiB |
+| `qwen25-coder-14b` | `qwen2.5-coder:14b`（不具合再現用） | ◎ |
+
+`scripts/vram_precheck.py` が **pull する前に**レジストリのマニフェストだけを見て
+載るかどうかを判定するので、13〜15GB を無駄に落とさずに済みます。
+Devstral Small 2 24B Q4 は T4 に **1.5GB 足りず載りません**（無料枠では L4 も
+引けないため、このリポジトリでは評価対象外）。
+
 ## 構成の要点
 
 - **推論エンジンは Ollama。** T4 は compute capability 7.5 で bf16 非対応、vLLM は不利
@@ -108,6 +164,9 @@ scripts/40_terminal_setup.sh   ターミナル用の ~/.bashrc 整備
 scripts/50_run.sh              セルから Cline を走らせるラッパ
 scripts/90_healthcheck.sh      切り分け + 30 秒予算の実測
 scripts/99_teardown.sh         片付け
+scripts/vram_precheck.py       pull 前に VRAM に載るか判定（手順書 §12.4）
+scripts/agents/                AGENTS.md のテンプレート（モデル別）
+remote/                        手元から VM を操作する層（手順書 §12）
 archive/browser-ide/           v1.0（code-server / トンネル構成）。手順書 §2 に廃止理由
 ```
 

@@ -47,7 +47,65 @@ else
     || die "起動しませんでした。ログ: $OLLAMA_LOG"
 fi
 
-hdr "3. ベースモデルの取得"
+hdr "3. VRAM 事前チェック（pull の前に判定する）"
+# ★ ここが無いと、15GB のモデルを落としきってから「載りません」と分かる。
+#   判定はレジストリのマニフェスト（数 KB）だけで行うので pull は不要。
+#   詳細は scripts/vram_precheck.py の docstring。
+# ★ 測る前に、ロード済みのモデルを必ず降ろす。
+#   OLLAMA_KEEP_ALIVE=-1 にしているため、前のモデルは放っておくと VRAM に
+#   居座り続ける。その状態で「空き VRAM」を測ると、載るはずのモデルまで
+#   NG と判定してしまう（実機で踏んだ: qwen3:8b が 7.7GB 占有していて
+#   空きが 7412 MiB しかなく、gpt-oss:20b が -6776 MiB と誤判定された）。
+#   どのみちこの後で新しいモデルをロードするので、ここで降ろすのが正しい。
+LOADED="$(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')"
+if [ -n "$LOADED" ]; then
+  log "先にロード済みモデルを降ろします: $(printf '%s' "$LOADED" | tr '\n' ' ')"
+  printf '%s\n' "$LOADED" | while read -r m; do
+    [ -n "$m" ] && ollama stop "$m" >/dev/null 2>&1 || true
+  done
+  sleep 3
+fi
+
+VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"
+log "空き VRAM: ${VRAM_FREE_MIB} MiB"
+
+# KV キャッシュの 1 トークンあたりのサイズ（MiB, q8_0 想定）。
+# 層数 / KV ヘッド数 / head_dim で決まるのでモデルごとに違う。
+# 既定は 8〜24B 級の安全側の値。プロファイル側から上書きできる。
+KV_MIB_PER_TOKEN="${KV_MIB_PER_TOKEN:-0.08}"
+# 計算バッファ（活性値・グラフ）。実測でおおむね 0.5〜0.7 GiB。
+COMPUTE_BUF_MIB="${COMPUTE_BUF_MIB:-640}"
+
+# set -e 下でも終了コードを自前で見たいので || true で受ける
+set +e
+python3 "$(cd "$(dirname "$0")" && pwd)/vram_precheck.py" \
+        "$BASE_MODEL" "$VRAM_FREE_MIB" "$NUM_CTX" \
+        "$KV_MIB_PER_TOKEN" "$COMPUTE_BUF_MIB" "$STATEDIR/vram-precheck.json"
+PRECHECK_RC=$?
+set -e
+
+case "$PRECHECK_RC" in
+  0) ok "VRAM は足ります" ;;
+  1)
+    if [ "${FORCE_VRAM:-0}" = "1" ]; then
+      warn "VRAM が足りませんが FORCE_VRAM=1 なので続行します。
+       層の一部が CPU にあふれ、推論が一桁遅くなります。ベンチの数字は
+       この構成の実力ではなく「あふれた状態の数字」になります。"
+    else
+      die "VRAM が足りないため pull を中止しました（15GB を無駄に落とさずに済みました）。
+
+     対策:
+       NUM_CTX を下げる       :  NUM_CTX=8192 bash scripts/20_ollama.sh
+       小さいモデルにする     :  MODEL_PROFILE=qwen3-14b bash scripts/20_ollama.sh
+       それでも試す           :  FORCE_VRAM=1 bash scripts/20_ollama.sh"
+    fi
+    ;;
+  2) die "モデル名を解決できませんでした: $BASE_MODEL
+     タグの綴りを確認してください（https://ollama.com/library）" ;;
+  *) warn "事前チェックを実施できませんでした。pull 後の判定に任せます。" ;;
+esac
+
+hdr "4. ベースモデルの取得"
 if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$BASE_MODEL"; then
   ok "取得済み: $BASE_MODEL"
 else
@@ -57,7 +115,7 @@ else
   ok "pull 完了: $BASE_MODEL"
 fi
 
-hdr "4. Cline 用モデルの作成 (num_ctx=$NUM_CTX)"
+hdr "5. Cline 用モデルの作成 (num_ctx=$NUM_CTX)"
 # ここが最重要。Ollama の既定 num_ctx は小さく、Cline のシステムプロンプトと
 # ファイル内容で即あふれる。あふれた分は "静かに切り捨てられる" ため、
 # 「指示を忘れる」「無いファイルを捏造する」という形で症状が出る。
@@ -90,7 +148,7 @@ sed 's/^/      /' "$MODELFILE"
 ollama create "$CLINE_MODEL" -f "$MODELFILE"
 ok "作成しました: $CLINE_MODEL"
 
-hdr "5. ウォームアップ（VRAM へのロード）"
+hdr "6. ウォームアップ（VRAM へのロード）"
 log "モデルを VRAM に載せます（初回は 30〜90 秒）"
 curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
      -H 'Content-Type: application/json' \
@@ -98,7 +156,7 @@ curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
      -o "$STATEDIR/warmup.json"
 ok "ロード完了"
 
-hdr "6. 速度ベンチマーク（この構成でいちばん重要な数字）"
+hdr "7. 速度ベンチマーク（この構成でいちばん重要な数字）"
 # Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
 # VS Code 拡張と違い、CLI 側にタイムアウト設定が無い。
 # したがって「30 秒でプロンプトを何トークン処理できるか」が実用性の上限を決める。
@@ -233,7 +291,7 @@ with open(out_path, "w", encoding="utf-8") as f:
                "typical_out_tokens": TYPICAL_OUT, "thinking_detected": thinking}, f)
 PY
 
-hdr "7. VRAM 実測"
+hdr "8. VRAM 実測"
 nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
            --format=csv,noheader | sed 's/^/      /'
 VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"

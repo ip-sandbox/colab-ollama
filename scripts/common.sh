@@ -15,6 +15,87 @@ export WORKSPACE="${WORKSPACE:-$WORKROOT/workspace}"
 export STATEDIR="${STATEDIR:-$WORKROOT/.cline-env}"
 
 # ---------------------------------------------------------------------------
+# モデルプロファイル
+# ---------------------------------------------------------------------------
+# モデルを差し替えるたびに BASE_MODEL / NUM_CTX / CODEX_TOOL_REPAIR /
+# AGENTS.md の内容を個別に合わせるのは間違えやすい。組み合わせに名前を付けて
+# 1 変数で切り替えられるようにする。
+#
+#   MODEL_PROFILE=gpt-oss-20b bash scripts/00_setup_all.sh --with-codex
+#
+# 優先順位は「明示した環境変数 > プロファイル > 従来の既定値」。
+# MODEL_PROFILE を指定しなければ、従来とまったく同じ挙動になる。
+#
+# ここで die() を使わないのは、ログ関数の定義がこの下にあるため。
+export MODEL_PROFILE="${MODEL_PROFILE:-}"
+
+_p_base=""; _p_ctx=""; _p_repair=""; _p_rules=""; _p_note=""; _p_kv=""
+case "$MODEL_PROFILE" in
+  "")
+    # 未指定。従来の既定値をそのまま使う。
+    ;;
+  qwen3-8b)
+    # 36 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 2*36*8*128 = 73728 B/token
+    _p_base="qwen3:8b";  _p_ctx=32768; _p_repair=0; _p_rules=minimal; _p_kv=0.07
+    _p_note="現行既定。tool-calling 実績あり（手順書 §5.6 の V-2 実測）"
+    ;;
+  qwen3-14b)
+    # 40 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 81920 B/token
+    _p_base="qwen3:14b"; _p_ctx=16384; _p_repair=0; _p_rules=minimal; _p_kv=0.08
+    _p_note="8b と同系列。思考トークンが生成予算を食う点に注意（§5.4）"
+    ;;
+  gpt-oss-20b)
+    # MXFP4 量子化の MoE。ollama 公称 14GB ≈ 13.0 GiB で、T4 の空き
+    # （実測 14913 MiB ≈ 14.56 GiB）に対して余裕が 1GiB 程度しかない。
+    # num_ctx を 32768 にすると載らないので 16384 に落としてある。
+    # KV は 24 層 / KV ヘッド 8 / head_dim 64 と小さい。q8_0 で 24576 B/token。
+    # 汎用の既定値 0.08 を使うと過大評価になり、載るものを NG と判定してしまう。
+    # （実測はさらに小さく 0.013 MiB/token。0.024 は安全側の値として残してある）
+    #
+    # 2026-09-17 の実機実測（T4 / num_ctx=16384、RESULT.md 追記を参照）:
+    #   MXFP4 は sm_75 でも動く。offloaded 25/25 layers, 100% GPU
+    #   VRAM 12499 MiB 使用 / 2414 MiB 空き
+    #   prefill 880 tok/s, generation 34.5 tok/s（qwen3:8b の 23.6 より速い）
+    #   安全プロンプト長 13,645 tok（判定 OK）
+    # VRAM 的には num_ctx=32768 も載るが、速度側が先に頭打ちになる
+    # （安全プロンプト長が 13.6k なので 16384 で釣り合っている）。
+    #
+    # ★ 修復プロキシを 1 にしているのは、タグ無し JSON の修復（本来の用途）では
+    #   なく **ollama/ollama#17638 の再送** のため。gpt-oss は apply_patch のような
+    #   「単一のフリーフォーム文字列引数」を取るツールで出力が array-wrap になり、
+    #   Ollama 自身がパースに失敗して HTTP 500 を返すことがある（非決定的・
+    #   実測 0.34.1 で発生）。プロキシはこの 500 に限って投げ直す。
+    #   上流が直れば 0 に戻してよい。
+    _p_base="gpt-oss:20b"; _p_ctx=16384; _p_repair=1; _p_rules=minimal; _p_kv=0.024
+    _p_note="MXFP4 MoE。T4 で実機確認済み（100% GPU, 34.5 tok/s）。ollama#17638 対策で再送プロキシ経由"
+    ;;
+  qwen25-coder-14b)
+    # 評価対象からは外したが、§5.8 / §5.8.1 の再現用に定義だけ残す。
+    # このモデルだけは修復プロキシと apply_patch 回避ルールが要る。
+    # 48 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 98304 B/token
+    _p_base="qwen2.5-coder:14b-instruct-q4_K_M"; _p_ctx=16384; _p_kv=0.094
+    _p_repair=1; _p_rules=apply-patch-workaround
+    _p_note="不具合の再現用（§5.8/§5.8.1）。評価対象からは外している"
+    ;;
+  *)
+    printf '\033[31m[FATAL]\033[0m MODEL_PROFILE=%s は未知です。\n' "$MODEL_PROFILE" >&2
+    printf '        使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / qwen25-coder-14b\n' >&2
+    printf '        （未指定なら従来の既定値で動きます）\n' >&2
+    exit 1
+    ;;
+esac
+
+# AGENTS.md に書く運用ルールの種類。
+#   minimal                 … 「1ファイルずつ」「書いたら確認」程度
+#   apply-patch-workaround  … qwen2.5-coder 用。apply_patch を禁じ heredoc を強制
+export AGENTS_RULESET="${AGENTS_RULESET:-${_p_rules:-minimal}}"
+
+# KV キャッシュの 1 トークンあたりのサイズ（MiB, q8_0 想定）。
+# 20_ollama.sh の pull 前 VRAM チェックが使う。モデルの層数 / KV ヘッド数 /
+# head_dim で決まるのでモデルごとに違う。既定は安全側に倒した汎用値。
+export KV_MIB_PER_TOKEN="${KV_MIB_PER_TOKEN:-${_p_kv:-0.08}}"
+
+# ---------------------------------------------------------------------------
 # Ollama
 # ---------------------------------------------------------------------------
 # 127.0.0.1 のみ。外部公開はしない（する必要が無い構成になった）。
@@ -36,9 +117,9 @@ export OLLAMA_MODELS="${OLLAMA_MODELS:-/root/.ollama/models}"
 # （生の JSON をそのままテキストで返す）。Cline はそれをツール呼び出しとして解釈できず、
 # チャットで説明するだけで一切ファイルを書かない。qwen3:8b は同一条件で <tool_call> を
 # 正しく守り、実タスクが完走することを実機で確認済み（V-2 実測、2026-09-03）。
-export BASE_MODEL="${BASE_MODEL:-qwen3:8b}"
+export BASE_MODEL="${BASE_MODEL:-${_p_base:-qwen3:8b}}"
 export CLINE_MODEL="${CLINE_MODEL:-cline-coder}"
-export NUM_CTX="${NUM_CTX:-32768}"
+export NUM_CTX="${NUM_CTX:-${_p_ctx:-32768}}"
 export NUM_PREDICT="${NUM_PREDICT:-8192}"
 
 # Cline CLI が 1 リクエストに使える秒数（実測値の評価基準に使う）
@@ -52,7 +133,11 @@ export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-30}"
 # openai/codex#2229）。CODEX_TOOL_REPAIR=1（既定）のとき、31_alt_agents.sh は
 # scripts/32_codex_tool_proxy.py を Codex と Ollama の間に起動し、Codex の
 # config.toml をこのプロキシへ向ける。0 にすると旧来どおり Ollama に直結する。
-export CODEX_TOOL_REPAIR="${CODEX_TOOL_REPAIR:-1}"
+#
+# 既定値はプロファイル依存。壊れていないモデル（qwen3 系・gpt-oss）に噛ませても
+# 益は無く、ストリーミング表示を 1 チャンクに潰す副作用だけが残るため 0 にする。
+# プロファイル未指定のときは従来どおり 1（qwen2.5-coder を想定した既定）。
+export CODEX_TOOL_REPAIR="${CODEX_TOOL_REPAIR:-${_p_repair:-1}}"
 export CODEX_PROXY_PORT="${CODEX_PROXY_PORT:-11435}"
 export CODEX_PROXY_BASE_URL="${CODEX_PROXY_BASE_URL:-http://127.0.0.1:$CODEX_PROXY_PORT}"
 
@@ -94,6 +179,19 @@ trap 'if [[ $- == *e* ]]; then die "line $LINENO で失敗しました (exit=$?)
 # ---------------------------------------------------------------------------
 # ユーティリティ
 # ---------------------------------------------------------------------------
+# 選択中のモデル構成を 1 行で示す。どのモデルで測った数字なのかを
+# ログに必ず残すため、主要スクリプトの冒頭で呼ぶ。
+model_profile_banner() {
+  if [ -n "$MODEL_PROFILE" ]; then
+    log "MODEL_PROFILE=$MODEL_PROFILE"
+    [ -n "${_p_note:-}" ] && printf '       %s\n' "$_p_note"
+  else
+    log "MODEL_PROFILE 未指定（従来の既定値で動きます）"
+  fi
+  printf '       BASE_MODEL=%s  NUM_CTX=%s  CODEX_TOOL_REPAIR=%s  AGENTS_RULESET=%s\n' \
+         "$BASE_MODEL" "$NUM_CTX" "$CODEX_TOOL_REPAIR" "$AGENTS_RULESET"
+}
+
 ensure_dirs() { mkdir -p "$LOGDIR" "$WORKSPACE" "$STATEDIR"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
