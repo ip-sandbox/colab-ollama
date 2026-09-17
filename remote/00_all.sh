@@ -25,8 +25,12 @@ usage() {
 
   --gpu VALUE          確保するアクセラレータ（既定 T4。GPU 無しは cpu）
   --retry N            確保に失敗したとき N 回まで再試行する（既定 0）
-                       T4 は無料枠では取り合いで 503 が普通に返るため、
-                       T4 を狙うなら --retry 10 などを付けると通りやすい
+                       間隔は既定 300s（COLAB_NEW_RETRY_INTERVAL で変更可）。
+                       T4 は無料枠では取り合いで 503 が普通に返る。
+                       ★ 長時間の張り込みは避けること。Colab の不正利用検知は
+                         公表されておらず、短い間隔で叩き続けるとレート制限を
+                         招くおそれがある。--retry 3〜5 程度にとどめ、
+                         取れなければ時間をおいて出直すほうが安全
   --profile NAME       MODEL_PROFILE（qwen3-8b / qwen3-14b / gpt-oss-20b /
                        qwen25-coder-14b）。省略時は VM 側の既定値
   --attach             セットアップ後そのまま codex TUI に入る
@@ -39,11 +43,11 @@ usage() {
 
 例:
 
-  # T4 が空くまで待って gpt-oss を構築し、そのまま codex に入る
-  bash remote/00_all.sh --gpu T4 --retry 10 --profile gpt-oss-20b --attach
+  # T4 を少し待って gpt-oss を構築し、そのまま codex に入る
+  bash remote/00_all.sh --gpu T4 --retry 3 --profile gpt-oss-20b --attach
 
   # 無人で評価だけ回して必ず止める
-  bash remote/00_all.sh --retry 10 --profile gpt-oss-20b --eval 5 --stop
+  bash remote/00_all.sh --retry 3 --profile gpt-oss-20b --eval 5 --stop
 
   # GPU が取れないときの退避（大きいモデルは載らない）
   bash remote/00_all.sh --gpu cpu

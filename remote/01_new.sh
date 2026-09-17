@@ -24,7 +24,37 @@ else
   #   COLAB_NEW_RETRIES 回まで待って再試行する。
   #   0（既定）なら従来どおり 1 回で諦める。
   RETRIES="${COLAB_NEW_RETRIES:-0}"
-  INTERVAL="${COLAB_NEW_RETRY_INTERVAL:-60}"
+  # ★ 既定を 300s（5 分）にしている理由
+  #
+  #   Colab の FAQ はリトライやポーリングを明示的には禁じていない。禁止されて
+  #   いるのは「複数アカウントで制限を回避する」「コンテナ化等で不正利用防止を
+  #   回避する」といった *回避* 行為で、単一アカウントで空きを問い合わせて 503 を
+  #   受け取ることはそれに当たらない。
+  #
+  #   ただし FAQ は「制限値は公表していない（時期により変動しうるため）」と明記し、
+  #   措置は「警告なくいつでも終了されうる」としている。つまり**明文化されていない
+  #   不正利用検知が存在する**。短い間隔で何時間も assign エンドポイントを叩くのは
+  #   人間の使い方から乖離しており、レート制限や一時的な制限を招く筋の行為になる。
+  #
+  #   「列挙されていない＝安全」ではない。既定は控えめに倒し、短くしたい場合は
+  #   利用者が明示的に上書きする（その際は警告を出す）。
+  INTERVAL="${COLAB_NEW_RETRY_INTERVAL:-300}"
+
+  if [ "$INTERVAL" -lt 60 ]; then
+    warn "COLAB_NEW_RETRY_INTERVAL=${INTERVAL}s は短すぎます。
+       Colab の不正利用検知は公表されていません。短い間隔で叩き続けると
+       レート制限や一時的な利用制限を招くおそれがあります。60s に引き上げます。
+       （どうしても短くするなら COLAB_NEW_RETRY_MIN も下げてください）"
+    INTERVAL="${COLAB_NEW_RETRY_MIN:-60}"
+  fi
+
+  # 総ポーリング時間が長くなるときは、それを自覚してもらう
+  TOTAL_MIN=$(( RETRIES * INTERVAL / 60 ))
+  if [ "$RETRIES" -gt 0 ] && [ "$TOTAL_MIN" -ge 60 ]; then
+    warn "最大 ${TOTAL_MIN} 分にわたって空きを問い合わせ続けます（${RETRIES} 回 x ${INTERVAL}s）。
+       長時間の張り込みは不正利用検知に触れる可能性があります。
+       T4 の空きは時間帯に依存するので、時間をおいて出直すほうが安全です。"
+  fi
   # colab CLI は 503 のたびに Python のトレースバックを丸ごと吐く（rich の枠付き）。
   # 再試行を繰り返すとログが読めなくなるので、出力は捨てて要点だけを残す。
   # 失敗が確定したときだけ全文を出す。
@@ -56,8 +86,10 @@ else
      GPU 無しで進めるなら:
          COLAB_GPU=cpu bash remote/01_new.sh"
     fi
-    warn "確保できませんでした。${INTERVAL}s 待って再試行します（残り $((RETRIES - attempt + 1)) 回）"
-    sleep "$INTERVAL"
+    # 同期した一斉ポーリングにならないよう ±20% のばらつきを入れる
+    JITTER=$(( INTERVAL * (80 + RANDOM % 41) / 100 ))
+    warn "確保できませんでした。${JITTER}s 待って再試行します（残り $((RETRIES - attempt + 1)) 回）"
+    sleep "$JITTER"
   done
   ok "確保しました: $COLAB_SESSION"
 fi

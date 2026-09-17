@@ -96,7 +96,7 @@ uv tool install --force "git+https://github.com/googlecolab/google-colab-cli@v0.
 
 ```bash
 # 一括（推奨）。T4 が空くまで待って構築し、そのまま codex に入る
-bash remote/00_all.sh --gpu T4 --retry 10 --profile gpt-oss-20b --attach
+bash remote/00_all.sh --gpu T4 --retry 3 --profile gpt-oss-20b --attach
 bash remote/09_stop.sh       # ★終わったら必ず
 
 # 個別に実行する場合
@@ -109,7 +109,9 @@ bash remote/09_stop.sh       # ★成果物を回収して停止
 ```
 
 無料枠の T4 は取り合いで `Service Unavailable` が普通に返るため、
-`--retry 10`（60 秒間隔で再試行）を付けると通りやすくなります。
+`--retry 3`（既定 300 秒間隔で再試行）を付けると通りやすくなります。
+**長時間の張り込みは避けてください**（Colab の不正利用検知は公表されておらず、
+短い間隔で叩き続けるとレート制限を招きます。手順書 §3.5）。
 GPU が取れないときは `--gpu cpu` で退避できます（大きいモデルは載りません）。
 
 `--proxy-mode` が OpenSSH の `ProxyCommand` 互換なので、生成される
