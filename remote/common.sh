@@ -126,10 +126,15 @@ require_colab_version() {
 
 require_gpu_valid() {
   case "$COLAB_GPU" in
+    # cpu / none は「アクセラレータ無しで取る」。T4 が Service Unavailable で
+    # 取れないときの退避先。Ollama で大きいモデルは動かせない（無料枠の CPU
+    # ランタイムは RAM 約 12.7GB）が、ツール呼び出しまわりの検証には使える。
+    cpu|CPU|none|NONE) COLAB_GPU="cpu" ;;
     T4|L4|G4|H100|A100) ;;
     *) die "COLAB_GPU=$COLAB_GPU は不正です。T4 / L4 / G4 / H100 / A100 のいずれかにしてください。
      ★ colab CLI は未知の値を黙って A100 に読み替えるため、ここで弾いています。
-     なお無料枠で引けるのは T4 のみです（L4 は不可、TPU v5e-1 は Ollama 非対応）。" ;;
+     無料枠で引ける GPU は T4 のみです（L4 は不可、TPU v5e-1 は Ollama 非対応）。
+     GPU 無しで取るなら COLAB_GPU=cpu を指定してください。" ;;
   esac
 }
 

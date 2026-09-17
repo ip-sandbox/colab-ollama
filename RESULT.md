@@ -358,7 +358,7 @@ qwen3 より 3 倍近く速い。T4 のような狭い環境では MoE の優位
 して書き出し**、ツール呼び出しを発行しないまま悩んで出力トークンを使い切る
 （上限 8192 に対し 9,196 / 12,936 使用）。§5.6 / §5.8 と同系統だが、harmony は
 **ツール名が JSON の外側**にあるため既存の修復では拾えなかった。
-`_find_harmony_tool_calls()` を追加して対応（ユニットテストのみ。実機未検証）。
+`_find_harmony_tool_calls()` を追加して対応。**実機で A/B 検証済み（§6.5）。**
 
 ### 6.3 実測（プロンプト: `pythonでfizzbuzzを書いてテストして。` × 5、再送のみ）
 
@@ -380,3 +380,50 @@ qwen3 より 3 倍近く速い。T4 のような狭い環境では MoE の優位
 `colab ssh` 側に自動作成を止めるフラグは無いため、`remote/proxycommand.sh` を
 ProxyCommand に挟み、**接続前にセッションの存在を確認して無ければ繋がずに失敗**
 させるようにした。VM を作るのは `remote/01_new.sh` だけの役目にする。
+
+### 6.5 harmony 修復の実機検証（モデル不要）
+
+T4 は `Service Unavailable` で取れず、CPU ランタイム（RAM 約 12.7GB）には
+13GB の gpt-oss:20b が載らない。そこで**モデルを使わずに**検証した。
+
+ユニットテストは「テキストから tool_calls を組み立てられるか」までしか見ない。
+本当に知りたいのは **Codex が修復後の tool_calls を受け取って実際にツールを
+実行するか**で、これは上流をスタブに差し替えれば確かめられる:
+
+```
+Codex CLI  ->  32_codex_tool_proxy.py  ->  scripts/test_harmony_e2e_stub.py
+```
+
+スタブは実機で観測した「harmony 構文がテキストに漏れた本文」を返す。
+
+**A/B（経路も SSE 包装も同一。変えたのはツール名だけ）:**
+
+| ツール名 | プロキシの判定 | codex exit | ファイル作成 |
+|---|---|---:|:--:|
+| `exec_command`（実在する） | **repaired** | 0 | **された** |
+| `this_tool_does_not_exist` | passthrough | 0 | されない |
+
+修復が発火した側でのみ Codex が実際にコマンドを実行した:
+
+```
+/bin/bash -lc 'echo HARMONY_REPAIR_WORKS > /content/workspace/harmony_proof.txt'
+```
+
+最初に試した対照（プロキシを外してスタブ直結）は**交絡していた**ので採用しない。
+スタブは SSE を喋らず、SSE 包装はプロキシの仕事なので、修復の有無と無関係に
+`stream disconnected before completion` になる。元の症状と同じ文言が出るため
+紛らわしいが、原因は別。上の A/B はプロキシを通したまま比較している。
+
+**副次的に分かったこと:**
+
+- Codex 0.154.0 が渡すツール: `exec_command` / `write_stdin` /
+  `request_user_input` / `view_image` / `multi_agent_v1` / `get_goal` /
+  `create_goal` / `update_goal` と `type: web_search`（name 無し）
+- **`apply_patch` はツールとして提供されていない。** §6.2 (1) で観測した
+  `{"cmd":"apply_patch <<'PATCH' ..."}` は、`exec_command` の `cmd`
+  （**string 型**）からシェル経由で apply_patch を呼ぼうとしたもの。
+  `cmd` が string である以上、末尾の `]` はモデルの誤りであり、
+  ollama#17638 の「array-wrap してしまう」という説明と一致する
+
+**測っていないこと**: gpt-oss の実成功率が 3/5 からどれだけ上がるか。
+それには T4 と実モデルが要る。

@@ -17,13 +17,21 @@ if session_exists; then
 else
   hdr "2. セッションの確保（GPU: $COLAB_GPU）"
   warn "ここから課金が始まります。終わったら bash remote/09_stop.sh を忘れずに。"
-  log "colab new -s $COLAB_SESSION --gpu $COLAB_GPU"
-  # 400 は「そのアクセラレータの割り当てが無い」。無料枠で T4 以外を
-  # 指定したときにここに来る。
-  colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" \
-    || die "セッションを確保できませんでした。
-     400 が返っていれば、このアカウントに $COLAB_GPU の割り当てがありません。
-     無料枠で引けるのは T4 のみです:  COLAB_GPU=T4 bash remote/01_new.sh"
+  # 400 は「そのアクセラレータの割り当てが無い」、503 (Service Unavailable) は
+  # 「今は空きが無い」。後者は時間をおけば取れることがある。
+  if [ "$COLAB_GPU" = "cpu" ]; then
+    log "colab new -s $COLAB_SESSION  （アクセラレータ無し）"
+    colab_cli new -s "$COLAB_SESSION" \
+      || die "CPU セッションを確保できませんでした。"
+  else
+    log "colab new -s $COLAB_SESSION --gpu $COLAB_GPU"
+    colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" \
+      || die "セッションを確保できませんでした。
+     400 なら、このアカウントに $COLAB_GPU の割り当てがありません。
+     503 (Service Unavailable) なら、いま空きが無いだけなので時間をおいて再試行。
+     無料枠で引ける GPU は T4 のみです。
+     GPU 無しで進めるなら:  COLAB_GPU=cpu bash remote/01_new.sh"
+  fi
   ok "確保しました: $COLAB_SESSION"
 fi
 
@@ -52,6 +60,24 @@ $(printf '%s' "$PROBE" | sed 's/^/       /')
 $(printf '%s' "$PROBE" | sed 's/^/       /')"
 fi
 ok "VM に入れました（$(printf '%s' "$PROBE" | tail -1)）"
+
+if [ "$COLAB_GPU" = "cpu" ]; then
+  hdr "5. VM 側の環境を整える（CPU なので GPU まわりは飛ばします）"
+  warn "アクセラレータ無しのセッションです。
+       Ollama は CPU で動きますが、無料枠の RAM は約 12.7GB しかないため
+       13GB の gpt-oss:20b などは載りません。小さいモデルで試してください。"
+  rsh 'free -g | awk "NR==2{print \"      RAM: \"\$2\"GB (空き \"\$7\"GB)\"}"' || true
+  hdr "完了"
+  cat <<EOF
+    セッション : $COLAB_SESSION （CPU）
+    ssh        : ssh -F $SSH_CONFIG $SSH_HOST_ALIAS
+
+    次: bash remote/02_deploy.sh
+
+    ${_c_bold}終わったら必ず:${_c_reset}  bash remote/09_stop.sh
+EOF
+  exit 0
+fi
 
 hdr "5. VM 側の環境を整える"
 # ★ ここを飛ばすと Ollama が黙って CPU に落ちる。詳細は common.sh の
