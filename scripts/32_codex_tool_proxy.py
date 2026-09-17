@@ -34,6 +34,19 @@ LISTEN_PORT = int(os.environ.get("CODEX_PROXY_PORT", "11435"))
 
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
+# --- gpt-oss（harmony 形式）がツール呼び出しをテキストに漏らす ---------------
+# 本来は harmony のチャネル構文で構造化出力になるが、これをそのまま本文に
+# 書き出してしまうことがある:
+#     to=functions.<NAME> <|constrain|>json<|message|>{ ...引数... }<|call|>
+# マーカーは欠けることがあるので constrain / message は任意にしてある。
+# 名前の直後に JSON が続くことを _find_harmony_tool_calls 側で確認するので、
+# 単なる言及（JSON が続かない文）を誤って拾うことはない。
+_HARMONY_CALL_RE = re.compile(
+    r"to\s*=\s*functions\.(?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)"
+    r"(?:\s*<\|constrain\|>\s*[A-Za-z0-9_]+)?"
+    r"(?:\s*<\|message\|>)?"
+)
+
 # --- gpt-oss + Ollama のツール呼び出しパース失敗への再送 ---------------------
 # ollama/ollama#17638（2026-08-09 報告・未修正。手元の 0.34.1 でも再現）:
 #   gpt-oss の出力が array-wrap になり、開き括弧が無いまま末尾に ] だけ残る。
@@ -84,6 +97,67 @@ def _extract_json_objects(text: str):
     return objs
 
 
+def _first_json_object(text: str):
+    """text の先頭（空白等を読み飛ばした位置）から JSON を 1 つだけ読む。
+
+    _extract_json_objects と違い「どこかにある JSON」を探さない。
+    harmony の <|message|> 直後という位置が意味を持つので、そこから読む。
+    見つからなければ None。
+    """
+    decoder = json.JSONDecoder()
+    i = 0
+    n = len(text)
+    # 前置きとして現れうるものだけ読み飛ばす（コードフェンス / 空白 / 改行）
+    while i < n and (text[i].isspace() or text[i] == "`"):
+        i += 1
+    if i >= n or text[i] != "{":
+        return None
+    try:
+        obj, _ = decoder.raw_decode(text, i)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _find_harmony_tool_calls(text: str, valid_tool_names: set[str]):
+    """gpt-oss の harmony 形式のツール呼び出しがテキストに漏れたものを拾う。
+
+    なぜ必要か（実機で観測、2026-09-17）:
+      gpt-oss は本来 harmony のチャネル構文で構造化出力を出す:
+
+        <|channel|>commentary to=functions.apply_patch <|constrain|>json
+        <|message|>{"patch":"*** Begin Patch ..."}<|call|>
+
+      ところが**この構文をそのままプレーンテキストとして本文に書き出し**、
+      ツール呼び出しを発行しないまま「どう呼ぼうか」と延々と悩んで
+      出力トークンを使い切ることがある（model_max_output_tokens 8192 に対し
+      9,196 / 12,936 トークン使って打ち切られた実例あり）。
+      結果、ファイルが 1 つも作られないまま終わる。
+
+      §5.6 / §5.8 の「構造化出力にせずテキストで返す」と同じ系統の症状。
+      既存の修復は {"name":..., "arguments":...} 形しか見ていないが、
+      harmony ではツール名が JSON の**外側**（to=functions.NAME）にあるため
+      拾えない。ここで拾って正しい tool_calls に組み替える。
+
+    誤爆を避けるため、次をすべて満たすものだけ拾う:
+      - ツール名が valid_tool_names にある
+      - 名前の直後（constrain/message マーカーを挟んでもよい）に
+        パース可能な JSON オブジェクトが続く
+    単に "to=functions.exec_command を使えばよい" と言及しただけの文（JSON が
+    続かない）は拾わない。
+    """
+    found = []
+    for m in _HARMONY_CALL_RE.finditer(text):
+        name = m.group("name")
+        if name not in valid_tool_names:
+            continue
+        args = _first_json_object(text[m.end():])
+        if args is None:
+            continue
+        found.append({"name": name, "arguments": args})
+    return found
+
+
 def _candidate_texts(content: str):
     """content から「JSON があるかもしれない箇所」の候補文字列を列挙する。"""
     yield content
@@ -101,6 +175,11 @@ def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
     """
     if not isinstance(text, str) or not text.strip():
         return []
+    # harmony 形式を先に見る。形が具体的なぶん誤爆しにくく、
+    # ツール名が JSON の外側にあるため下の汎用ロジックでは拾えない。
+    harmony = _find_harmony_tool_calls(text, valid_tool_names)
+    if harmony:
+        return harmony
     found = []
     seen = set()
     for candidate in _candidate_texts(text):
