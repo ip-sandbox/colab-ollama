@@ -25,19 +25,31 @@ else
   #   0（既定）なら従来どおり 1 回で諦める。
   RETRIES="${COLAB_NEW_RETRIES:-0}"
   INTERVAL="${COLAB_NEW_RETRY_INTERVAL:-60}"
+  # colab CLI は 503 のたびに Python のトレースバックを丸ごと吐く（rich の枠付き）。
+  # 再試行を繰り返すとログが読めなくなるので、出力は捨てて要点だけを残す。
+  # 失敗が確定したときだけ全文を出す。
+  NEWLOG="$(mktemp)"
+  trap 'rm -f "$NEWLOG"' EXIT
   attempt=0
   while : ; do
     attempt=$((attempt + 1))
     if [ "$COLAB_GPU" = "cpu" ]; then
-      log "colab new -s $COLAB_SESSION  （アクセラレータ無し）"
-      colab_cli new -s "$COLAB_SESSION" && break
+      log "colab new -s $COLAB_SESSION（アクセラレータ無し・試行 $attempt）"
+      colab_cli new -s "$COLAB_SESSION" >"$NEWLOG" 2>&1 && { cat "$NEWLOG"; break; }
     else
       log "colab new -s $COLAB_SESSION --gpu $COLAB_GPU（試行 $attempt）"
-      colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" && break
+      colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" >"$NEWLOG" 2>&1 \
+        && { cat "$NEWLOG"; break; }
     fi
+    # 原因の 1 行だけ拾う（Service Unavailable / 400 など）
+    REASON="$(grep -aoE '(Service Unavailable|Bad Request|Forbidden|Unauthorized|Not Found)' \
+                "$NEWLOG" | head -1)"
+    log "  -> ${REASON:-確保できず}"
 
     if [ "$attempt" -gt "$RETRIES" ]; then
-      die "セッションを確保できませんでした（$attempt 回試行）。
+      printf '\n    colab new の出力（全文）:\n' >&2
+      sed 's/^/      /' "$NEWLOG" >&2
+      die "セッションを確保できませんでした（$attempt 回試行 / ${REASON:-原因不明}）。
      400 なら、このアカウントに $COLAB_GPU の割り当てがありません。
      503 (Service Unavailable) なら空きが無いだけなので、時間をおけば取れます:
          COLAB_NEW_RETRIES=10 bash remote/01_new.sh
