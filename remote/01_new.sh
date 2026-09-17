@@ -18,20 +18,35 @@ else
   hdr "2. セッションの確保（GPU: $COLAB_GPU）"
   warn "ここから課金が始まります。終わったら bash remote/09_stop.sh を忘れずに。"
   # 400 は「そのアクセラレータの割り当てが無い」、503 (Service Unavailable) は
-  # 「今は空きが無い」。後者は時間をおけば取れることがある。
-  if [ "$COLAB_GPU" = "cpu" ]; then
-    log "colab new -s $COLAB_SESSION  （アクセラレータ無し）"
-    colab_cli new -s "$COLAB_SESSION" \
-      || die "CPU セッションを確保できませんでした。"
-  else
-    log "colab new -s $COLAB_SESSION --gpu $COLAB_GPU"
-    colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" \
-      || die "セッションを確保できませんでした。
+  # 「今は空きが無い」。
+  # ★ T4 は無料枠では取り合いになっており、503 (Service Unavailable) が普通に
+  #   返る。400（割り当てが無い）と違って時間をおけば取れるので、
+  #   COLAB_NEW_RETRIES 回まで待って再試行する。
+  #   0（既定）なら従来どおり 1 回で諦める。
+  RETRIES="${COLAB_NEW_RETRIES:-0}"
+  INTERVAL="${COLAB_NEW_RETRY_INTERVAL:-60}"
+  attempt=0
+  while : ; do
+    attempt=$((attempt + 1))
+    if [ "$COLAB_GPU" = "cpu" ]; then
+      log "colab new -s $COLAB_SESSION  （アクセラレータ無し）"
+      colab_cli new -s "$COLAB_SESSION" && break
+    else
+      log "colab new -s $COLAB_SESSION --gpu $COLAB_GPU（試行 $attempt）"
+      colab_cli new -s "$COLAB_SESSION" --gpu "$COLAB_GPU" && break
+    fi
+
+    if [ "$attempt" -gt "$RETRIES" ]; then
+      die "セッションを確保できませんでした（$attempt 回試行）。
      400 なら、このアカウントに $COLAB_GPU の割り当てがありません。
-     503 (Service Unavailable) なら、いま空きが無いだけなので時間をおいて再試行。
-     無料枠で引ける GPU は T4 のみです。
-     GPU 無しで進めるなら:  COLAB_GPU=cpu bash remote/01_new.sh"
-  fi
+     503 (Service Unavailable) なら空きが無いだけなので、時間をおけば取れます:
+         COLAB_NEW_RETRIES=10 bash remote/01_new.sh
+     GPU 無しで進めるなら:
+         COLAB_GPU=cpu bash remote/01_new.sh"
+    fi
+    warn "確保できませんでした。${INTERVAL}s 待って再試行します（残り $((RETRIES - attempt + 1)) 回）"
+    sleep "$INTERVAL"
+  done
   ok "確保しました: $COLAB_SESSION"
 fi
 

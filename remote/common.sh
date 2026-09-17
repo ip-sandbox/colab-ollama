@@ -78,6 +78,13 @@ die() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# 前提チェックの失敗用。die() と違い「VM を止めろ」とは言わない。
+# require_* はどれも VM を確保する前に走るので、停止を促すのは誤誘導になる。
+precondition_fail() {
+  printf '%s[前提エラー]%s %s\n\n' "$_c_red" "$_c_reset" "$*" >&2
+  exit 1
+}
+
 # ---------------------------------------------------------------------------
 # colab CLI の呼び出し
 # ---------------------------------------------------------------------------
@@ -104,17 +111,17 @@ colab_cmd_str() {
 
 # colab CLI が 0.7.0 以上か。0.6.x には colab ssh が無い。
 require_colab_version() {
-  have colab || die "colab CLI がありません。導入:
+  have colab || precondition_fail "colab CLI がありません。導入:
        uv tool install \"git+https://github.com/googlecolab/google-colab-cli@v0.7.1\""
 
   local ver major minor
   ver="$(command colab version 2>/dev/null | sed -n 's/^Version:[[:space:]]*//p' | head -1)"
-  [ -n "$ver" ] || die "colab のバージョンを判定できませんでした（colab version の出力が想定外）"
+  [ -n "$ver" ] || precondition_fail "colab のバージョンを判定できませんでした（colab version の出力が想定外）"
 
   major="${ver%%.*}"
   minor="$(printf '%s' "$ver" | cut -d. -f2)"
   if [ "$major" -eq 0 ] && [ "$minor" -lt 7 ]; then
-    die "colab CLI $ver には 'colab ssh' がありません（0.7.0 で追加）。
+    precondition_fail "colab CLI $ver には 'colab ssh' がありません（0.7.0 で追加）。
      PyPI には 0.6.0 までしか出ていないので、git から入れ直してください:
 
          uv tool install --force \"git+https://github.com/googlecolab/google-colab-cli@v0.7.1\"
@@ -131,7 +138,7 @@ require_gpu_valid() {
     # ランタイムは RAM 約 12.7GB）が、ツール呼び出しまわりの検証には使える。
     cpu|CPU|none|NONE) COLAB_GPU="cpu" ;;
     T4|L4|G4|H100|A100) ;;
-    *) die "COLAB_GPU=$COLAB_GPU は不正です。T4 / L4 / G4 / H100 / A100 のいずれかにしてください。
+    *) precondition_fail "COLAB_GPU=$COLAB_GPU は不正です。T4 / L4 / G4 / H100 / A100 のいずれかにしてください。
      ★ colab CLI は未知の値を黙って A100 に読み替えるため、ここで弾いています。
      無料枠で引ける GPU は T4 のみです（L4 は不可、TPU v5e-1 は Ollama 非対応）。
      GPU 無しで取るなら COLAB_GPU=cpu を指定してください。" ;;
@@ -141,15 +148,15 @@ require_gpu_valid() {
 require_ssh_key() {
   # サーバ側は RSA 鍵を拒否する。ed25519 か ecdsa が要る。
   if [ ! -f "$SSH_IDENTITY" ]; then
-    die "SSH 秘密鍵がありません: $SSH_IDENTITY
+    precondition_fail "SSH 秘密鍵がありません: $SSH_IDENTITY
      ★ Colab 側は ssh-rsa を拒否します。ed25519 で作ってください:
          ssh-keygen -t ed25519 -f $SSH_IDENTITY -N ''"
   fi
   case "$(ssh-keygen -y -f "$SSH_IDENTITY" 2>/dev/null | awk '{print $1}')" in
     ssh-ed25519|ecdsa-sha2-*) ;;
-    ssh-rsa) die "$SSH_IDENTITY は RSA 鍵です。Colab 側がサーバで拒否します。
+    ssh-rsa) precondition_fail "$SSH_IDENTITY は RSA 鍵です。Colab 側がサーバで拒否します。
      ed25519 を作って SSH_IDENTITY に指定してください。" ;;
-    "") die "$SSH_IDENTITY から公開鍵を導出できませんでした（パスフレーズ付き？）。" ;;
+    "") precondition_fail "$SSH_IDENTITY から公開鍵を導出できませんでした（パスフレーズ付き？）。" ;;
   esac
 }
 
