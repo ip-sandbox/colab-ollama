@@ -329,10 +329,12 @@ elif safe_tokens >= 6000:
            "      より小さいモデルへの切り替えを検討する価値があります。")
 else:
     verdict = "NG"
-    msg = ("Cline のシステムプロンプトだけで 30 秒を超えます。この構成では実用になりません。\n"
+    msg = (f"エージェントのシステムプロンプトだけで {budget} 秒を超えます。かなり厳しい構成です。\n"
            "      対策: (1) BASE_MODEL をより小さいものにする\n"
-           "            (2) CLINE_PROVIDER=openai-compatible を試す（/v1 経由で 30 秒制限を回避できる可能性）\n"
-           "            (3) モデルが VRAM に載り切っているか確認する（CPU オフロードは致命的に遅い）")
+           "            (2) モデルが VRAM に載り切っているか確認する（CPU オフロードは致命的に遅い）\n"
+           "            (3) 1 応答を短く保つよう AGENTS.md / .cline/rules で誘導する\n"
+           "      ※ この判定は CLINE_REQUEST_BUDGET_SEC を基準にした机上の値です。\n"
+           "        実タスクが完走するかは --eval で実測してください（乖離した実績あり）。")
 
 print(f"      判定: {verdict}")
 print(f"      {msg}")

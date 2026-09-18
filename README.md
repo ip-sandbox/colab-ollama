@@ -134,7 +134,7 @@ MODEL_PROFILE=gpt-oss-20b bash remote/03_setup.sh
 | `qwen3-8b` | `qwen3:8b`（現行既定） | ◎ |
 | `qwen3-14b` | `qwen3:14b` | ◎ |
 | `gpt-oss-20b` | `gpt-oss:20b`（MXFP4 MoE） | ○ 余裕 +725MiB |
-| `gemma4-12b-qat` | `gemma4:12b-it-qat`（Gemma 4 12B QAT, 重み実測 6653 MiB） | ◎ 余裕 +5982MiB (ctx=32768) |
+| `gemma4-12b-qat` | `gemma4:12b-it-qat`（Gemma 4 12B QAT） | ◎ 実測 7681MiB / 100% GPU・実タスク5/5 |
 | `qwen25-coder-14b` | `qwen2.5-coder:14b`（不具合再現用） | ◎ |
 
 `scripts/vram_precheck.py` が **pull する前に**レジストリのマニフェストだけを見て
@@ -142,10 +142,9 @@ MODEL_PROFILE=gpt-oss-20b bash remote/03_setup.sh
 Devstral Small 2 24B Q4 は T4 に **1.5GB 足りず載りません**（無料枠では L4 も
 引けないため、このリポジトリでは評価対象外）。
 
-`gemma4-12b-qat` は tool calling に既知の不具合があり
-（[ollama#15539](https://github.com/ollama/ollama/issues/15539) /
-[#15798](https://github.com/ollama/ollama/issues/15798)）、修復プロキシ既定 ON で
-始めます。詳細は手順書 §5.10。
+`gemma4-12b-qat` は T4 で実機確認済みです（prefill 618 / generation 13.9 tok/s、
+100% GPU、`codex exec` の実タスク **5/5 完走**）。tool calling も正常なので
+修復プロキシは不要（`CODEX_TOOL_REPAIR=0`）。詳細は手順書 §5.10。
 
 ## GPU が取れないとき
 

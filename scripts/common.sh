@@ -204,8 +204,10 @@ else
   export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
   export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
 fi
-# ★重要: Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
-#   モデルのロード時間がその 30 秒に食い込むと確実に落ちるので、絶対にアンロードさせない。
+# ★重要: モデルのロード時間がリクエストの制限時間に食い込むと落ちるので、
+#   絶対にアンロードさせない。（かつては Cline の 30 秒制限が理由だったが、
+#   3.0.62 では 300 秒になった。手順書 §7 の訂正。それでも 7GB のロードを
+#   毎回挟む理由は無いので、この設定は据え置く。）
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
@@ -221,8 +223,17 @@ export CLINE_MODEL="${CLINE_MODEL:-cline-coder}"
 export NUM_CTX="${NUM_CTX:-${_p_ctx:-32768}}"
 export NUM_PREDICT="${NUM_PREDICT:-8192}"
 
-# Cline CLI が 1 リクエストに使える秒数（実測値の評価基準に使う）
-export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-30}"
+# Cline CLI が 1 リクエストに使える秒数（ベンチの判定基準に使う）
+#
+# ★ 2026-09-18 に 30 -> 300 へ変更した。手順書 §7 の訂正のとおり、
+#   Cline CLI 3.0.62 の OLLAMA_DEFAULT_TIMEOUT_MS は 300000（300 秒）で、
+#   30 秒で切られるという前提はもう成り立たない（実測済み）。
+#
+#   30 のままだと判定が実態と矛盾する。実際 T4 + gemma4:12b-it-qat で
+#   「判定 NG / この構成では実用になりません」と出したその同じ実行で、
+#   codex exec の実タスクは 5/5 完走している（1 回 37〜92 秒）。
+#   生成 500 トークンが 35.9 秒かかる、というだけの理由で NG になっていた。
+export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-300}"
 
 # ---------------------------------------------------------------------------
 # Codex CLI 用ツール呼び出し修復プロキシ（手順書 §5.8）
