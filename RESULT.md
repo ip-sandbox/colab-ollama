@@ -528,3 +528,152 @@ ssh の終了がリモートコマンドの終了で決まるので SIGPIPE に�
   起きる条件を引く必要があり、今回は引けなかった
 - 再送の寄与を分離するなら `CODEX_PROXY_TOOLCALL_RETRIES=0` で対照を取る
 - n を増やさない限り 3/5 と 5/5 の差は判定できない
+
+---
+
+# 追記 (2026-09-18): Cline の 30 秒タイムアウトは無くなっていた／gemma4 と CPU 検証レーン
+
+計画: [`PLAN.md`](PLAN.md) / 手順: 手順書 §5.10・§7 の訂正・§13
+
+## 環境
+
+- 実行場所: Claude on the web のコンテナ（**GPU 無し**）
+- 4 vCPU / RAM 15GB / ディスク空き 30GB / Node v22.22.2 / Python 3.11.15
+- Cline CLI **3.0.62**（`npm install -g cline`）
+- ★ egress ポリシーで `registry.ollama.ai` と `ollama.com` が **403**、
+  `huggingface.co` も到達不可。`registry.npmjs.org` / `pypi.org` /
+  GitHub のリリースアセットは到達可
+
+したがって **実モデル（gemma4:12b-it-qat）はこのセッションでは動かせていない**。
+以下はすべて「モデルを必要としない検証」の結果である。
+
+## 1. ★ Cline CLI の 30 秒タイムアウトは 3.0.62 では起きない
+
+手順書 §7 が長らく「最大の壁」として扱ってきた前提が崩れた。
+
+遅延を秒単位で指定できるスタブ上流（`scripts/test_slow_upstream_stub.py`）を立て、
+`scripts/35_cline_timeout_probe.sh` で測った。
+
+| 上流の応答時間 | プロバイダ | 経過 | exit | 結果 |
+|---:|---|---:|---:|---|
+| 45s | `ollama` | 47s | 0 | 完走 |
+| 45s | `openai-compatible` | 47s | 0 | 完走 |
+| 120s | `ollama` | 122s | 0 | 完走 |
+| 120s | `openai-compatible` | 122s | 0 | 完走 |
+| 340s | `ollama` | **302s** | 1 | `Ollama request timed out after 300 seconds` |
+
+**タイムアウトの仕組み自体は残っているが、既定値が 30 秒ではなく 300 秒**である。
+実装にも該当の定数がある:
+
+```
+@cline/llms/dist/providers.js   OLLAMA_DEFAULT_TIMEOUT_MS = 300000
+@cline/llms/dist/index.js       同上
+```
+
+さらに `O0(e)` がプロバイダ設定の `timeoutMs` を読む実装になっているので、
+**「CLI 側に設定項目が無い」という記述も正確ではない**。
+
+**「モデルを使わずに測った」ことが効いている。** 実モデルでは 300 秒ちょうどを
+狙って遅延を作れないので、この境界は出せない。スタブなら 340 秒を指定して
+302 秒での中断を再現できる。GPU も要らない。
+
+### 未検証だった V-4 の決着
+
+§7 の対策 6 番「`CLINE_PROVIDER=openai-compatible` なら 30 秒制限を回避できる
+可能性（未検証）」は **意味を失った**。120 秒の遅延に対して両プロバイダとも
+完走し、差は観測されなかった。そもそも回避すべき 30 秒が存在しない。
+
+### ★ 測定を 1 度汚染した（記録として残す）
+
+最初に 310 秒で測ったとき **258 秒で中断**し、`The operation timed out.` という
+別のメッセージが出た。原因は**自分で測定中にパッチスクリプトを適用・復元したこと**。
+`OLLAMA_DEFAULT_TIMEOUT_MS` を 300000 → 600000 → 300000 と動かしている最中に
+計測が走っていた。リクエストログにも、その時だけ余計な `/api/tags` が
+`+214.5s` に現れている。
+
+パッケージを 300000 に戻し、実行中に一切触らずに測り直した結果が上の 302 秒
+（`Ollama request timed out after 300 seconds`）。**計測中に計測対象を変更しない。**
+
+## 2. Cline の設定ファイルの場所が変わっていた
+
+`scripts/30_cline_cli.sh` は
+
+```
+$CLINE_DATA_DIR/data/settings/providers.json
+```
+
+を決め打ちしていたが、3.0.62 が実際に書くのは
+
+```
+$CLINE_DATA_DIR/settings/providers.json
+```
+
+だった。このため **設定は正しく書けているのに**「providers.json がありません。
+cline auth が失敗した可能性があります」と誤警告していた。
+両方を見る `cline_providers_json()` を `common.sh` に置いて解決。
+
+## 3. GPU が無くても走るようにした（ACCEL）
+
+`10_preflight.sh` は `nvidia-smi` が無ければ即 `die` していたので、
+GPU が取れないだけで CPU でも潰せる検証まで止まっていた。
+
+`ACCEL`（`gpu` / `cpu`、既定は `nvidia-smi` の有無で自動判定）を `common.sh` に
+置き、`10_preflight.sh` / `20_ollama.sh` を分岐させた。
+`vram_precheck.py` は判定ロジックを 1 本のまま、表示ラベルだけ引数化した
+（出力 JSON のパスとキーは据え置き。e82d035 で `20_ollama.sh` が
+`weights_mib` を読み始めているため）。
+
+GPU 無しのこのコンテナで `10_preflight.sh` が `die` せず完走することを確認した。
+
+## 4. レジストリが塞がれている環境で pull を試みない
+
+`ollama.com`（インストーラ）と `registry.ollama.ai`（重み）は**別のホスト**で、
+後者だけが塞がれている環境が実在する（この環境がそう）。この場合、
+ollama のインストールまで通ってから pull だけが失敗する。
+
+`10_preflight.sh` が両方を独立にチェックして
+`$STATEDIR/net-registry-ok` に残し、`60_cpu_verify.sh` がそれを読んで
+**4 秒で理由を名指しして止まる**ことを実測で確認した（pull を試みない）。
+
+## 5. gemma4:12b-it-qat を評価対象に入れた（実挙動は未確認）
+
+`docs/リモート化計画.md` §0.3 は Gemma を「Ollama のテンプレートに
+tool calling が入っていない」として却下していた。これは **Gemma 3** の話で、
+Gemma 4 では capabilities に `tools` が入っている
+（`gemma4:12b-it-qat` は vision / tools / thinking / audio、約 7.2GB）。
+
+ただし **capabilities は今回も保証にならない**見込みが高い。
+「tool_calls に入らず content に漏れる」不具合が 2 系統報告されている:
+
+| issue | 環境 | 漏れ方 |
+|---|---|---|
+| [#15539](https://github.com/ollama/ollama/issues/15539) | 0.20.6 / `gemma4:e4b` | `system prompt` + `think:false` + `tools` が揃うと `{"tool_calls":[{"function":N,"args":{}}]}` + `<channel|>` が content に落ちる |
+| [#15798](https://github.com/ollama/ollama/issues/15798) | 0.21.1 / `gemma4-64k` | `<\|tool_call\|>` 等の特殊トークンが本文に漏れる。`finish_reason` は `stop`。**Closed as not planned** |
+
+どちらも既存の修復ロジック（トップレベルの `{"name":..,"arguments":..}` を探す）
+では拾えない形なので、`32_codex_tool_proxy.py` に両方を足した。
+単体テスト `test_tool_proxy_gemma4.py` は 17 ケース全て緑、既存の
+`test_tool_proxy_harmony.py` (10) と `test_tool_proxy_retry.py` (6) も緑のまま。
+
+**#15798 の実装は issue の記述から起こしたもので、逐語のサンプルが無い。**
+#15539 は issue 本文の逐語サンプルをそのまま使っている。
+
+## 測っていないこと
+
+このセッションは GPU も実モデルも使えていないので、以下は**まったく分かっていない**:
+
+- **`gemma4:12b-it-qat` が実際に `tool_calls` を返すかどうか。** 最大の未知数。
+  `scripts/34_toolcall_probe.sh` で証拠を採るところから
+- 足した Gemma 4 用の修復が、実機の漏れ方に本当に噛み合うか
+  （特に #15798 は形を推定で書いている）
+- `KV_MIB_PER_TOKEN` の実値。今は安全側の暫定値 0.05
+- T4 での実用速度 / 安全プロンプト長 / 実タスクの完走率
+- Codex CLI 側のタイムアウト挙動（今回測ったのは Cline のみ）
+
+次の一手は、`registry.ollama.ai` を許可したネットワークポリシーで環境を作り直し、
+
+```bash
+MODEL_PROFILE=gemma4-12b-qat bash scripts/60_cpu_verify.sh
+```
+
+を回して `$STATEDIR/probe/*.content.txt` を採ること。

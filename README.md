@@ -134,12 +134,35 @@ MODEL_PROFILE=gpt-oss-20b bash remote/03_setup.sh
 | `qwen3-8b` | `qwen3:8b`（現行既定） | ◎ |
 | `qwen3-14b` | `qwen3:14b` | ◎ |
 | `gpt-oss-20b` | `gpt-oss:20b`（MXFP4 MoE） | ○ 余裕 +725MiB |
+| `gemma4-12b-qat` | `gemma4:12b-it-qat`（Gemma 4 12B QAT, 約 7.2GB） | ◎ 未実測 |
 | `qwen25-coder-14b` | `qwen2.5-coder:14b`（不具合再現用） | ◎ |
 
 `scripts/vram_precheck.py` が **pull する前に**レジストリのマニフェストだけを見て
 載るかどうかを判定するので、13〜15GB を無駄に落とさずに済みます。
 Devstral Small 2 24B Q4 は T4 に **1.5GB 足りず載りません**（無料枠では L4 も
 引けないため、このリポジトリでは評価対象外）。
+
+`gemma4-12b-qat` は tool calling に既知の不具合があり
+（[ollama#15539](https://github.com/ollama/ollama/issues/15539) /
+[#15798](https://github.com/ollama/ollama/issues/15798)）、修復プロキシ既定 ON で
+始めます。詳細は手順書 §5.10。
+
+## GPU が取れないとき
+
+無料枠の T4 は取り合いで、確保できないことのほうが多くあります。
+一方で、この構成で確かめたいことの**半分は GPU を必要としません**
+（ツール呼び出しが成立するか / エージェントが何秒で切るか / 配線が正しいか）。
+
+```bash
+# GPU 無しの環境でも走ります（10_preflight.sh はもう die しません）
+MODEL_PROFILE=gemma4-12b-qat bash scripts/60_cpu_verify.sh
+
+# 重みも要らない範囲だけ
+SKIP_MODEL=1 bash scripts/60_cpu_verify.sh
+```
+
+`registry.ollama.ai` に到達できない環境では、`ollama pull` を試みずに
+理由を名指しして止まります。3 層の検証レーンの考え方は手順書 §13。
 
 ## 構成の要点
 
@@ -170,12 +193,17 @@ scripts/10_preflight.sh        GPU/VRAM/ディスク/Node/ターミナル手段�
 scripts/20_ollama.sh           Ollama + モデル + num_ctx + prefill ベンチ
 scripts/30_cline_cli.sh        Node 22 + Cline CLI + ローカル接続設定
 scripts/31_alt_agents.sh       任意: Codex CLI / aider / Qwen Code
-scripts/32_codex_tool_proxy.py Codex 用ツール呼び出し修復プロキシ（手順書 §5.8）
+scripts/32_codex_tool_proxy.py Codex 用ツール呼び出し修復プロキシ（手順書 §5.8・§5.10）
+scripts/33_patch_cline_timeout.sh Cline の Ollama タイムアウト上限を上げる（§7）
+scripts/34_toolcall_probe.sh   tool_calls が本当に返るかを証拠付きで確かめる（§5.10）
+scripts/35_cline_timeout_probe.sh Cline が何秒で切るかをモデル無しで実測する（§7）
 scripts/40_terminal_setup.sh   ターミナル用の ~/.bashrc 整備
 scripts/50_run.sh              セルから Cline を走らせるラッパ
+scripts/60_cpu_verify.sh       GPU 無しで潰せる検証を一括で通す（手順書 §13）
 scripts/90_healthcheck.sh      切り分け + 30 秒予算の実測
 scripts/99_teardown.sh         片付け
-scripts/vram_precheck.py       pull 前に VRAM に載るか判定（手順書 §12.4）
+scripts/vram_precheck.py       pull 前にメモリに載るか判定（手順書 §12.4）
+scripts/test_*.py              修復プロキシの単体テストと、検証用のスタブ上流
 scripts/agents/                AGENTS.md のテンプレート（モデル別）
 remote/                        手元から VM を操作する層（手順書 §12）
 archive/browser-ide/           v1.0（code-server / トンネル構成）。手順書 §2 に廃止理由
