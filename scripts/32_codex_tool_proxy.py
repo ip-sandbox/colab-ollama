@@ -67,6 +67,36 @@ _TOOL_PARSE_ERR_RE = re.compile(r"error parsing tool call", re.IGNORECASE)
 TOOLCALL_RETRIES = int(os.environ.get("CODEX_PROXY_TOOLCALL_RETRIES", "3"))
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
+# --- Gemma 4 系がツール呼び出しをテキストに漏らす ---------------------------
+# §5.6 / §5.8 / §12.7 と同じ系統の症状が Gemma 4 でも報告されている。
+# 漏れ方が 2 通りあり、どちらも既存の
+# 「{"name": ..., "arguments": {...}} を探す」ロジックでは拾えない。
+#
+# (1) ollama/ollama#15539（ollama 0.20.6 / gemma4:e4b）
+#     system prompt + think:false + tools が揃うとパーサが取りこぼし、
+#     **ラッパー付きの JSON** が content に落ちる:
+#         {"tool_calls":[{"function":"GetLiveContext","args":{}}]}
+#         <channel|>
+#     キー名が name/arguments ではなく function/args である点が肝。
+#     末尾の <channel|> は raw_decode が無視するので前処理は要らない。
+#
+# (2) ollama/ollama#15798（ollama 0.21.1 / gemma4-64k、Closed as not planned）
+#     チャットテンプレートの特殊トークンが本文にそのまま漏れる:
+#         <|tool_call|> / <|channel|> / <|tool_response|>
+#     加えて "call:" プレフィックスが付き、文字列引数が本来の引用符ではなく
+#     <|"|>...<|"|> で囲まれる。finish_reason は stop になるため、
+#     クライアントは「普通に喋っただけ」と解釈してターンを終える。
+#
+# ★ (2) は issue に逐語のサンプルが無く、**記述から起こした実装**である。
+#   実機の生応答は scripts/34_toolcall_probe.sh が *.content.txt に保存するので、
+#   採取できたら test_tool_proxy_gemma4.py のデータを実物に差し替え、
+#   ここの正規表現も必要に応じて直すこと。
+#   （test_tool_proxy_harmony.py が実機採取の文字列を使っているのと同じ流儀）
+_GEMMA_TOKEN_RE = re.compile(r"<\|(?:tool_call|tool_response|channel|call|message)\|>")
+_GEMMA_QUOTE_RE = re.compile(r'<\|"\|>')
+# 行頭（や空白直後）の "call:" プレフィックス。JSON の中身には現れない形に限る。
+_GEMMA_CALL_PREFIX_RE = re.compile(r"(?:^|\n)\s*call:\s*", re.MULTILINE)
+
 _id_counter = itertools.count()
 
 
@@ -158,6 +188,65 @@ def _find_harmony_tool_calls(text: str, valid_tool_names: set[str]):
     return found
 
 
+def _gemma_normalize(text: str) -> str:
+    """Gemma 4 のテンプレート特殊トークンを剥がして、素の JSON に近づける。
+
+    ollama#15798 で本文に漏れると報告されている装飾だけを落とす:
+      <|tool_call|> / <|channel|> / <|tool_response|> / <|call|> / <|message|>
+      行頭の "call:" プレフィックス
+      文字列引数を囲む <|"|> を本来の " に戻す
+
+    ★ 元の text を壊さないこと。ここで作った文字列は **追加の候補** として
+      扱い、元の text も従来どおり走査する（_candidate_texts 参照）。
+      装飾が無い応答に対しては何も変わらない。
+    """
+    if "<|" not in text and "call:" not in text:
+        return text
+    out = _GEMMA_QUOTE_RE.sub('"', text)
+    out = _GEMMA_TOKEN_RE.sub("", out)
+    out = _GEMMA_CALL_PREFIX_RE.sub("\n", out)
+    return out
+
+
+def _find_gemma_wrapped_tool_calls(text: str, valid_tool_names: set[str]):
+    """{"tool_calls":[{"function":NAME,"args":{...}}]} 形を拾う（ollama#15539）。
+
+    既存の _find_tool_calls_in_text はトップレベルに name と arguments を
+    持つオブジェクトしか見ないので、この形は素通りしてしまう。
+
+    キー名は実装によって揺れるため、function/name と args/arguments の
+    どちらも受ける。誤爆防止は既存方針どおり「ツール名が有効集合にあること」。
+    """
+    found = []
+    for obj in _extract_json_objects(text):
+        if not isinstance(obj, dict):
+            continue
+        calls = obj.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            # {"function": "NAME", ...} と {"function": {"name": "NAME"}} の両方
+            fn = call.get("function")
+            name = fn if isinstance(fn, str) else None
+            if name is None and isinstance(fn, dict):
+                name = fn.get("name")
+            if name is None:
+                name = call.get("name")
+            if not isinstance(name, str) or name not in valid_tool_names:
+                continue
+            args = call.get("args")
+            if args is None and isinstance(fn, dict):
+                args = fn.get("arguments")
+            if args is None:
+                args = call.get("arguments")
+            if args is None:
+                args = {}
+            found.append({"name": name, "arguments": args})
+    return found
+
+
 def _candidate_texts(content: str):
     """content から「JSON があるかもしれない箇所」の候補文字列を列挙する。"""
     yield content
@@ -165,6 +254,12 @@ def _candidate_texts(content: str):
         yield m.group(1)
     for m in _CODE_FENCE_RE.finditer(content):
         yield m.group(1)
+    # Gemma 4 の特殊トークンを剥がした版。元の content と違うときだけ足す。
+    normalized = _gemma_normalize(content)
+    if normalized != content:
+        yield normalized
+        for m in _CODE_FENCE_RE.finditer(normalized):
+            yield m.group(1)
 
 
 def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
@@ -180,6 +275,13 @@ def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
     harmony = _find_harmony_tool_calls(text, valid_tool_names)
     if harmony:
         return harmony
+    # Gemma 4 のラッパー形（ollama#15539）。こちらもトップレベルに
+    # name/arguments を持たないので、下の汎用ロジックでは拾えない。
+    # 特殊トークンが被っている場合に備え、剥がした版でも試す。
+    for candidate in (text, _gemma_normalize(text)):
+        wrapped = _find_gemma_wrapped_tool_calls(candidate, valid_tool_names)
+        if wrapped:
+            return wrapped
     found = []
     seen = set()
     for candidate in _candidate_texts(text):
