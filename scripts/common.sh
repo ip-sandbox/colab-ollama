@@ -278,6 +278,24 @@ accel_free_mib() {
   fi
 }
 
+# cline_providers_json — Cline CLI のプロバイダ設定ファイルの実際の場所を返す
+#
+# ★ 置き場所は CLI の版で変わる。実機で確認した実績:
+#     3.0.62 : $CLINE_DATA_DIR/settings/providers.json
+#     それ以前: $CLINE_DATA_DIR/data/settings/providers.json
+#   古いほうを決め打ちしていたため、3.0.62 では設定が正しく書けているのに
+#   「providers.json がありません。cline auth が失敗した可能性があります」と
+#   誤警告していた（2026-09-18 実測）。
+#   存在するほうを返し、どちらも無ければ現行版の場所を返す（作成先として使える）。
+cline_providers_json() {
+  local new="$CLINE_DATA_DIR/settings/providers.json"
+  local old="$CLINE_DATA_DIR/data/settings/providers.json"
+  if [ -f "$new" ]; then printf '%s\n' "$new"
+  elif [ -f "$old" ]; then printf '%s\n' "$old"
+  else printf '%s\n' "$new"
+  fi
+}
+
 # accel_mem_report — 現在のメモリ状況を数行で出す（末尾の実測用）
 accel_mem_report() {
   if [ "$ACCEL" = "cpu" ]; then
