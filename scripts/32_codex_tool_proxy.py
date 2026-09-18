@@ -92,10 +92,27 @@ _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 #   採取できたら test_tool_proxy_gemma4.py のデータを実物に差し替え、
 #   ここの正規表現も必要に応じて直すこと。
 #   （test_tool_proxy_harmony.py が実機採取の文字列を使っているのと同じ流儀）
-_GEMMA_TOKEN_RE = re.compile(r"<\|(?:tool_call|tool_response|channel|call|message)\|>")
-_GEMMA_QUOTE_RE = re.compile(r'<\|"\|>')
-# 行頭（や空白直後）の "call:" プレフィックス。JSON の中身には現れない形に限る。
-_GEMMA_CALL_PREFIX_RE = re.compile(r"(?:^|\n)\s*call:\s*", re.MULTILINE)
+# ★ トークンは **左右非対称** である。2026-09-18 にレジストリから
+#   gemma4:12b-it-qat の GGUF メタデータ（tokenizer.chat_template, 17,466 文字）を
+#   Range 取得して実物を確認した。issue #15798 の文中にある `<|tool_call|>` という
+#   表記は不正確で、実際には開きが `<|tool_call>`、閉じが `<tool_call|>`。
+#   当初この対称形を仮定して実装しており、**実出力には一致しなかった**。
+#
+#   テンプレートに現れるトークンの全体（`<|"|>` 以外すべて非対称）:
+#       <|tool_call>     … <tool_call|>
+#       <|tool_response> … <tool_response|>
+#       <|channel>       … <channel|>
+#       <|turn>          … <turn|>
+#       <|tool>          … <tool|>
+#       <|"|>            （これだけ対称。文字列の引用に使う）
+_GEMMA_TOKEN_RE = re.compile(
+    r"<\|(?:tool_call|tool_response|channel|turn|tool|image)>"
+    r"|</?(?:tool_call|tool_response|channel|turn|tool)\|>"
+)
+_GEMMA_QUOTE = '<|"|>'
+_GEMMA_QUOTE_RE = re.compile(re.escape(_GEMMA_QUOTE))
+_GEMMA_CALL_OPEN = "<|tool_call>call:"
+_GEMMA_CALL_CLOSE = "<tool_call|>"
 
 _id_counter = itertools.count()
 
@@ -200,12 +217,156 @@ def _gemma_normalize(text: str) -> str:
       扱い、元の text も従来どおり走査する（_candidate_texts 参照）。
       装飾が無い応答に対しては何も変わらない。
     """
-    if "<|" not in text and "call:" not in text:
+    if "<|" not in text and "<tool" not in text and "<channel" not in text:
         return text
     out = _GEMMA_QUOTE_RE.sub('"', text)
     out = _GEMMA_TOKEN_RE.sub("", out)
-    out = _GEMMA_CALL_PREFIX_RE.sub("\n", out)
+    # `<|tool_call>call:` の "call:" は上でトークンを剥がすと行頭に残る。
+    # ネイティブ形式は _find_gemma_native_tool_calls が別途扱うので、
+    # ここでは JSON が続くケース（#15539 系）のために取り除くだけにする。
+    out = re.sub(r"(?:^|\n)\s*call:\s*", "\n", out)
     return out
+
+
+def _gemma_parse_value(text: str, i: int):
+    """Gemma 4 のツール引数 1 個を読み、(値, 次の位置) を返す。失敗時は (None, i)。
+
+    テンプレートの format_argument マクロが吐く形をそのまま読む:
+        文字列  <|"|>...<|"|>      （**キーは裸なので JSON ではない**）
+        真偽値  true / false
+        写像    {key:VALUE,key:VALUE}
+        配列    [VALUE,VALUE]
+        それ以外はそのままの字面（数値など）
+    """
+    n = len(text)
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n:
+        return None, i
+
+    # 文字列: <|"|> ... <|"|>
+    if text.startswith(_GEMMA_QUOTE, i):
+        start = i + len(_GEMMA_QUOTE)
+        end = text.find(_GEMMA_QUOTE, start)
+        if end == -1:
+            return None, i
+        return text[start:end], end + len(_GEMMA_QUOTE)
+
+    # 写像
+    if text[i] == "{":
+        obj, i = {}, i + 1
+        while True:
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == "}":
+                return obj, i + 1
+            # キーは裸。次の ':' まで
+            colon = text.find(":", i)
+            if colon == -1:
+                return None, i
+            key = text[i:colon].strip()
+            if not key:
+                return None, i
+            val, i = _gemma_parse_value(text, colon + 1)
+            if val is None and i == colon + 1:
+                return None, i
+            obj[key] = val
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            if i < n and text[i] == "}":
+                return obj, i + 1
+            return None, i
+
+    # 配列
+    if text[i] == "[":
+        arr, i = [], i + 1
+        while True:
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == "]":
+                return arr, i + 1
+            val, i = _gemma_parse_value(text, i)
+            if val is None:
+                return None, i
+            arr.append(val)
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            if i < n and text[i] == "]":
+                return arr, i + 1
+            return None, i
+
+    # 素の字面（true / false / 数値など）。区切りまで読む。
+    j = i
+    while j < n and text[j] not in ",}]":
+        j += 1
+    raw = text[i:j].strip()
+    if raw == "true":
+        return True, j
+    if raw == "false":
+        return False, j
+    if raw == "null":
+        return None, j
+    try:
+        return int(raw), j
+    except ValueError:
+        pass
+    try:
+        return float(raw), j
+    except ValueError:
+        pass
+    return (raw if raw else None), j
+
+
+def _find_gemma_native_tool_calls(text: str, valid_tool_names: set[str]):
+    """Gemma 4 がテンプレートどおりの形で本文に吐いたツール呼び出しを拾う。
+
+    実際の形式（GGUF の chat_template で確認、2026-09-18）:
+
+        <|tool_call>call:write_file{content:<|"|>hi<|"|>,path:<|"|>a.txt<|"|>}<tool_call|>
+
+    ★ これは JSON ではない。キーが裸で、文字列が <|"|> で囲まれている。
+      よって「<|"|> を " に置換して json.loads」では絶対に読めない。専用に読む。
+      （当初はそれで済むと仮定した実装を入れていたが、テンプレート実物と
+       突き合わせて誤りと分かった。）
+
+    引数が文字列として渡された場合、テンプレートは中身をそのまま出すので
+    オブジェクトとして読めないことがある。その場合は生文字列のまま返す
+    （_args_to_str が文字列をそのまま扱える）。
+
+    誤爆防止は既存方針どおり、ツール名が valid_tool_names にあるものだけ。
+    """
+    found = []
+    pos = 0
+    while True:
+        start = text.find(_GEMMA_CALL_OPEN, pos)
+        if start == -1:
+            break
+        i = start + len(_GEMMA_CALL_OPEN)
+        brace = text.find("{", i)
+        if brace == -1:
+            break
+        name = text[i:brace].strip()
+        close = text.find(_GEMMA_CALL_CLOSE, brace)
+        pos = (close + len(_GEMMA_CALL_CLOSE)) if close != -1 else brace + 1
+        if name not in valid_tool_names:
+            continue
+        args, end = _gemma_parse_value(text, brace)
+        if not isinstance(args, dict):
+            # 引数が文字列だった場合など。閉じトークンまでを生で渡す。
+            if close != -1:
+                raw = text[brace + 1:close].rstrip()
+                raw = raw[:-1] if raw.endswith("}") else raw
+                args = raw
+            else:
+                continue
+        found.append({"name": name, "arguments": args})
+    return found
 
 
 def _find_gemma_wrapped_tool_calls(text: str, valid_tool_names: set[str]):
@@ -275,6 +436,12 @@ def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
     harmony = _find_harmony_tool_calls(text, valid_tool_names)
     if harmony:
         return harmony
+    # Gemma 4 がテンプレートどおりのネイティブ形式で吐いた場合（ollama#15798）。
+    # <|tool_call>call:NAME{...}<tool_call|> は JSON ではないので専用に読む。
+    # いちばん形が具体的なので最優先で見る。
+    native = _find_gemma_native_tool_calls(text, valid_tool_names)
+    if native:
+        return native
     # Gemma 4 のラッパー形（ollama#15539）。こちらもトップレベルに
     # name/arguments を持たないので、下の汎用ロジックでは拾えない。
     # 特殊トークンが被っている場合に備え、剥がした版でも試す。

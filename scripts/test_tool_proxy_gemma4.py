@@ -10,11 +10,14 @@ Gemma 4 系には、ツール呼び出しが tool_calls に入らず content に
       ★ issue 本文に逐語のサンプルがあるので、それをそのまま使っている
 
   (2) ollama/ollama#15798 — テンプレート特殊トークンの漏れ
-      <|tool_call|> / <|"|> / <|channel|> / "call:" プレフィックス
-      ★ issue に逐語のサンプルが無く、**記述から起こしたもの**。
-        実機の生応答が採れたら（scripts/34_toolcall_probe.sh が
-        *.content.txt に保存する）、必ず実物に差し替えること。
-        test_tool_proxy_harmony.py が実機採取の文字列を使っているのと同じ流儀。
+      <|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>
+      ★ 2026-09-18 に **モデルの chat_template 実物** と突き合わせて書き直した。
+        レジストリのブロブ先頭を Range 取得して GGUF の tokenizer.chat_template
+        （17,466 文字）を読み、tool call を吐く箇所をそのまま写している。
+        issue 本文の `<|tool_call|>` という表記は不正確で、実際のトークンは
+        開き `<|tool_call>` / 閉じ `<tool_call|>` の **非対称**。
+        当初は対称形を仮定していて、実出力には一致しなかった。
+        なお引数は **JSON ではない**（キーが裸、文字列が <|"|> 引用）。
 
 回帰の担保も兼ねる: 既存の harmony / 素の JSON / 誤爆防止が壊れていないこと。
 
@@ -131,44 +134,99 @@ def _():
 # (2) ollama#15798: テンプレート特殊トークンの漏れ
 # =========================================================================
 
-@case("#15798: <|tool_call|> と <|channel|> を剥がして拾う")
+@case("#15798: テンプレートどおりの基本形を拾う")
 def _():
-    text = ('<|tool_call|>{"name":"write_file",'
-            '"arguments":{"path":"hello.txt","content":"hi"}}<|channel|>')
-    found = P._find_tool_calls_in_text(text, TOOLS)
-    return check(len(found) == 1 and found[0]["name"] == "write_file",
-                 str(found))
-
-
-@case('#15798: <|"|> で囲まれた文字列引数を本来の引用符に戻す')
-def _():
-    text = ('<|tool_call|>{<|"|>name<|"|>:<|"|>shell<|"|>,'
-            '<|"|>arguments<|"|>:{<|"|>cmd<|"|>:<|"|>ls -la<|"|>}}')
+    # chat_template の該当箇所:
+    #   '<|tool_call>call:' + name + '{' ... '}<tool_call|>'
+    #   文字列は format_argument が <|"|> で囲む
+    text = ('<|tool_call>call:write_file'
+            '{content:<|"|>hi<|"|>,path:<|"|>hello.txt<|"|>}<tool_call|>')
     found = P._find_tool_calls_in_text(text, TOOLS)
     return check(
-        len(found) == 1 and found[0]["name"] == "shell"
-        and found[0]["arguments"] == {"cmd": "ls -la"}, str(found))
+        len(found) == 1 and found[0]["name"] == "write_file"
+        and found[0]["arguments"] == {"content": "hi", "path": "hello.txt"},
+        str(found))
 
 
-@case('#15798: "call:" プレフィックスが付いていても拾う')
+@case("#15798: 真偽値と数値は引用されない")
 def _():
-    text = 'call: <|tool_call|>{"name":"shell","arguments":{"cmd":"pwd"}}'
+    text = '<|tool_call>call:shell{cmd:<|"|>ls<|"|>,quiet:true,n:3}<tool_call|>'
     found = P._find_tool_calls_in_text(text, TOOLS)
-    return check(len(found) == 1 and found[0]["name"] == "shell", str(found))
+    return check(
+        len(found) == 1
+        and found[0]["arguments"] == {"cmd": "ls", "quiet": True, "n": 3},
+        str(found))
 
 
-@case("#15798: 特殊トークン + ラッパー形の合わせ技も拾う")
+@case("#15798: 入れ子の写像と配列")
 def _():
-    text = ('<|tool_call|>{"tool_calls":[{"function":"write_file",'
-            '"args":{"path":"x"}}]}<|tool_response|>')
+    text = ('<|tool_call>call:shell{opts:{deep:true,name:<|"|>x<|"|>},'
+            'args:[<|"|>a<|"|>,<|"|>b<|"|>]}<tool_call|>')
+    found = P._find_tool_calls_in_text(text, TOOLS)
+    return check(
+        len(found) == 1
+        and found[0]["arguments"] == {"opts": {"deep": True, "name": "x"},
+                                      "args": ["a", "b"]},
+        str(found))
+
+
+@case("#15798: 文字列の中の , や } で区切りを誤らない")
+def _():
+    # 素朴に } を探すと壊れるケース。閉じ <|"|> まで読むこと。
+    text = '<|tool_call>call:write_file{path:<|"|>a,b}c.txt<|"|>}<tool_call|>'
+    found = P._find_tool_calls_in_text(text, TOOLS)
+    return check(
+        len(found) == 1 and found[0]["arguments"] == {"path": "a,b}c.txt"},
+        str(found))
+
+
+@case("#15798: 前後に地の文があっても拾う")
+def _():
+    text = ('まずファイルを作ります。\n'
+            '<|tool_call>call:write_file{path:<|"|>x.txt<|"|>}<tool_call|>\n'
+            'できました。')
     found = P._find_tool_calls_in_text(text, TOOLS)
     return check(len(found) == 1 and found[0]["name"] == "write_file",
                  str(found))
+
+
+@case("#15798: 複数の呼び出しを順に拾う")
+def _():
+    text = ('<|tool_call>call:shell{cmd:<|"|>a<|"|>}<tool_call|>'
+            '<|tool_call>call:write_file{path:<|"|>b<|"|>}<tool_call|>')
+    found = P._find_tool_calls_in_text(text, TOOLS)
+    return check([f["name"] for f in found] == ["shell", "write_file"],
+                 str(found))
+
+
+@case("#15798: ネイティブ形式でも未知のツール名は拾わない（誤爆防止）")
+def _():
+    text = '<|tool_call>call:rm_rf_everything{path:<|"|>/<|"|>}<tool_call|>'
+    found = P._find_tool_calls_in_text(text, TOOLS)
+    return check(found == [], f"拾ってしまった: {found}")
+
+
+@case("#15798: 閉じトークンが欠けていても引数が読めれば拾う")
+def _():
+    text = '<|tool_call>call:shell{cmd:<|"|>pwd<|"|>}'
+    found = P._find_tool_calls_in_text(text, TOOLS)
+    return check(len(found) == 1 and found[0]["arguments"] == {"cmd": "pwd"},
+                 str(found))
+
+
+@case("トークンは非対称である（対称形は実在しない）")
+def _():
+    # 当初 <|tool_call|> という対称形を仮定して実装し、外していた。
+    # 実テンプレートに出るのは開き <|tool_call> と閉じ <tool_call|> だけ。
+    tpl_tokens = ("<|tool_call>", "<tool_call|>", "<|tool_response>",
+                  "<tool_response|>", "<|channel>", "<channel|>",
+                  "<|turn>", "<turn|>", "<|tool>", "<tool|>")
+    bad = [t for t in tpl_tokens if not P._GEMMA_TOKEN_RE.fullmatch(t)]
+    return check(not bad, f"正規表現が取りこぼすトークン: {bad}")
 
 
 @case("_gemma_normalize は装飾の無い文字列を変えない")
 def _():
-    # 正常な応答に余計な加工をしないこと。ここが崩れると全モデルに影響する。
     plain = 'ふつうの日本語の返事です。{"a": 1} を含んでいても同じ。'
     return check(P._gemma_normalize(plain) == plain,
                  repr(P._gemma_normalize(plain)))
