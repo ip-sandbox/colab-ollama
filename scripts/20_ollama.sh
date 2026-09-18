@@ -47,7 +47,8 @@ else
     || die "起動しませんでした。ログ: $OLLAMA_LOG"
 fi
 
-hdr "3. VRAM 事前チェック（pull の前に判定する）"
+MEM_LABEL="$(accel_mem_label)"
+hdr "3. $MEM_LABEL 事前チェック（pull の前に判定する）"
 # ★ ここが無いと、15GB のモデルを落としきってから「載りません」と分かる。
 #   判定はレジストリのマニフェスト（数 KB）だけで行うので pull は不要。
 #   詳細は scripts/vram_precheck.py の docstring。
@@ -66,8 +67,8 @@ if [ -n "$LOADED" ]; then
   sleep 3
 fi
 
-VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"
-log "空き VRAM: ${VRAM_FREE_MIB} MiB"
+MEM_FREE_MIB="$(accel_free_mib)"
+log "空き $MEM_LABEL: ${MEM_FREE_MIB} MiB"
 
 # KV キャッシュの 1 トークンあたりのサイズ（MiB, q8_0 想定）。
 # 層数 / KV ヘッド数 / head_dim で決まるのでモデルごとに違う。
@@ -76,23 +77,33 @@ KV_MIB_PER_TOKEN="${KV_MIB_PER_TOKEN:-0.08}"
 # 計算バッファ（活性値・グラフ）。実測でおおむね 0.5〜0.7 GiB。
 COMPUTE_BUF_MIB="${COMPUTE_BUF_MIB:-640}"
 
+# ★ 出力先とキーは変えないこと。手順 4 の pull 前の警告がこの JSON の
+#   weights_mib を読んで「重みは約 N GB」と出している（e82d035）。
+#   CPU モードでも同じパス・同じキーで書き出す。ラベルだけが変わる。
+#
 # set -e 下でも終了コードを自前で見たいので || true で受ける
 set +e
 python3 "$(cd "$(dirname "$0")" && pwd)/vram_precheck.py" \
-        "$BASE_MODEL" "$VRAM_FREE_MIB" "$NUM_CTX" \
-        "$KV_MIB_PER_TOKEN" "$COMPUTE_BUF_MIB" "$STATEDIR/vram-precheck.json"
+        "$BASE_MODEL" "$MEM_FREE_MIB" "$NUM_CTX" \
+        "$KV_MIB_PER_TOKEN" "$COMPUTE_BUF_MIB" "$STATEDIR/vram-precheck.json" \
+        "$MEM_LABEL"
 PRECHECK_RC=$?
 set -e
 
 case "$PRECHECK_RC" in
-  0) ok "VRAM は足ります" ;;
+  0) ok "$MEM_LABEL は足ります" ;;
   1)
     if [ "${FORCE_VRAM:-0}" = "1" ]; then
-      warn "VRAM が足りませんが FORCE_VRAM=1 なので続行します。
+      if [ "$ACCEL" = "cpu" ]; then
+        warn "RAM が足りませんが FORCE_VRAM=1 なので続行します。
+       スワップが無い環境では OOM Killer に殺されます。"
+      else
+        warn "VRAM が足りませんが FORCE_VRAM=1 なので続行します。
        層の一部が CPU にあふれ、推論が一桁遅くなります。ベンチの数字は
        この構成の実力ではなく「あふれた状態の数字」になります。"
+      fi
     else
-      die "VRAM が足りないため pull を中止しました（15GB を無駄に落とさずに済みました）。
+      die "$MEM_LABEL が足りないため pull を中止しました（重みを無駄に落とさずに済みました）。
 
      対策:
        NUM_CTX を下げる       :  NUM_CTX=8192 bash scripts/20_ollama.sh
@@ -171,6 +182,14 @@ curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
 ok "ロード完了"
 
 hdr "7. 速度ベンチマーク（この構成でいちばん重要な数字）"
+# ★ CPU では、ここで出る数字は「この構成の実力」ではない。判定 NG も当然出る。
+#   消さずに残すのは、進捗の把握（生きているか / どれくらい待つか）に使えるから。
+#   結論に使ってはいけない、とだけ明示する。
+if [ "$ACCEL" = "cpu" ]; then
+  warn "CPU モードです。以下の数字と判定は**参考値**で、この構成の実力ではありません。
+       CPU で 12B 級を回すと生成は数 tok/s になり、判定はまず NG になります。
+       モデル選定の根拠にはせず、T4 を確保してから測り直してください（手順書 §13）。"
+fi
 # Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
 # VS Code 拡張と違い、CLI 側にタイムアウト設定が無い。
 # したがって「30 秒でプロンプトを何トークン処理できるか」が実用性の上限を決める。
@@ -305,17 +324,16 @@ with open(out_path, "w", encoding="utf-8") as f:
                "typical_out_tokens": TYPICAL_OUT, "thinking_detected": thinking}, f)
 PY
 
-hdr "8. VRAM 実測"
-nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
-           --format=csv,noheader | sed 's/^/      /'
-VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"
-if [ "$VRAM_FREE_MIB" -lt 512 ]; then
-  warn "空き VRAM が ${VRAM_FREE_MIB}MiB しかありません。長い文脈を投げた瞬間に OOM します。
+hdr "8. $MEM_LABEL 実測"
+accel_mem_report | sed 's/^/      /'
+MEM_FREE_MIB="$(accel_free_mib)"
+if [ "$MEM_FREE_MIB" -lt 512 ]; then
+  warn "空き $MEM_LABEL が ${MEM_FREE_MIB}MiB しかありません。長い文脈を投げた瞬間に OOM します。
        NUM_CTX を下げる（32768 -> 16384）か、BASE_MODEL を 7B 級に落としてください。"
-elif [ "$VRAM_FREE_MIB" -lt 1500 ]; then
-  warn "空き VRAM ${VRAM_FREE_MIB}MiB。動きますが余裕がありません。長時間セッションでは NUM_CTX を下げる方が安全です。"
+elif [ "$MEM_FREE_MIB" -lt 1500 ]; then
+  warn "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。動きますが余裕がありません。長時間セッションでは NUM_CTX を下げる方が安全です。"
 else
-  ok "空き VRAM ${VRAM_FREE_MIB}MiB。余裕があります。"
+  ok "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。余裕があります。"
 fi
 
 hdr "完了"

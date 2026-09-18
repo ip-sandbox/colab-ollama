@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pull する前に、そのモデルが VRAM に載るかを判定する。
+"""pull する前に、そのモデルがメモリに載るかを判定する。
 
 なぜ必要か
 ----------
@@ -17,6 +17,17 @@ Ollama のレジストリからマニフェストだけを引いて、重みレ�
 KV キャッシュのサイズはモデルの層数 / KV ヘッド数 / head_dim で決まるが、
 マニフェストからは分からない。そのため 1 トークンあたりの MiB を外から渡す
 （プロファイルごとの実測値、既定は 8〜24B 級の安全側の値）。
+
+GPU と CPU
+----------
+計算そのものは VRAM でも システム RAM でも同じ（重み + KV + バッファ が
+空きに収まるか）なので、**判定ロジックは 1 本のまま**にして、最後の引数で
+表示上のラベルだけを切り替える。T4 が取れないときに CPU で先へ進むための
+経路で、呼び出し側は scripts/common.sh の accel_mem_label / accel_free_mib。
+
+★ 出力 JSON のパスとキーは呼び出し側の都合で固定されている。
+  20_ollama.sh の pull 前の警告が weights_mib を読んでいるので、
+  ラベルを変えてもキー名は変えないこと。
 
 終了コード
 ----------
@@ -79,10 +90,14 @@ def fetch_weights_mib(model: str) -> float:
 
 
 def main() -> int:
-    if len(sys.argv) != 7:
+    if len(sys.argv) not in (7, 8):
         print(
             "usage: vram_precheck.py <model> <free_mib> <num_ctx> "
-            "<kv_mib_per_token> <compute_buf_mib> <out_json>",
+            "<kv_mib_per_token> <compute_buf_mib> <out_json> [mem_label]",
+            file=sys.stderr,
+        )
+        print(
+            "       mem_label は表示用のラベル（VRAM / RAM）。省略時は VRAM。",
             file=sys.stderr,
         )
         return 2
@@ -93,6 +108,8 @@ def main() -> int:
     kv_per_tok = float(sys.argv[4])
     compute_buf = int(sys.argv[5])
     out_path = sys.argv[6]
+    # 省略時が VRAM なのは、既存の呼び出し（6 引数）を壊さないため。
+    mem_label = sys.argv[7] if len(sys.argv) == 8 else "VRAM"
 
     weights_mib = fetch_weights_mib(model)
     kv_mib = num_ctx * kv_per_tok
@@ -105,7 +122,7 @@ def main() -> int:
     print(f"      計算バッファ : {compute_buf:8.0f} MiB")
     print("      " + "-" * 45)
     print(f"      必要量       : {need_mib:8.0f} MiB ({need_mib / 1024:.2f} GiB)")
-    print(f"      空き VRAM    : {free_mib:8.0f} MiB ({free_mib / 1024:.2f} GiB)")
+    print(f"      空き {mem_label:<8}: {free_mib:8.0f} MiB ({free_mib / 1024:.2f} GiB)")
     print(f"      余裕         : {margin:+8.0f} MiB")
     print()
 
@@ -127,7 +144,10 @@ def main() -> int:
         print(f"      判定: NG — {-margin:.0f} MiB 足りません。")
         print("      対策: (1) NUM_CTX を下げる")
         print("            (2) より小さい量子化 / より小さいモデルにする")
-        print("            (3) VRAM の大きい GPU を使う（無料枠では T4 のみ）")
+        if mem_label == "RAM":
+            print("            (3) GPU ランタイムを確保して VRAM に載せる")
+        else:
+            print("            (3) VRAM の大きい GPU を使う（無料枠では T4 のみ）")
         return 1
 
     if margin < WARN_MARGIN_MIB:

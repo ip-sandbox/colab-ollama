@@ -15,6 +15,27 @@ export WORKSPACE="${WORKSPACE:-$WORKROOT/workspace}"
 export STATEDIR="${STATEDIR:-$WORKROOT/.cline-env}"
 
 # ---------------------------------------------------------------------------
+# アクセラレータの種別
+# ---------------------------------------------------------------------------
+# Colab の T4 は無料枠では取り合いで、確保できないことのほうが多い。
+# GPU が無いというだけで 1 行も先に進めないと、CPU でも潰せる検証
+# （ツール呼び出しが成立するか / Cline が何秒で切るか）まで T4 待ちになる。
+# そこで「GPU か CPU か」を 1 か所で決め、各スクリプトはこれを見て分岐する。
+#
+#   ACCEL=cpu bash scripts/60_cpu_verify.sh   # 明示的に CPU として扱う
+#
+# 未指定なら nvidia-smi の有無で決める。ここで `have` を使わないのは、
+# 定義がこのファイルのずっと下にあるため。
+export ACCEL="${ACCEL:-$(command -v nvidia-smi >/dev/null 2>&1 && echo gpu || echo cpu)}"
+case "$ACCEL" in
+  gpu|cpu) ;;
+  *)
+    printf '\033[31m[FATAL]\033[0m ACCEL=%s は未知です（gpu か cpu）。\n' "$ACCEL" >&2
+    exit 1
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # モデルプロファイル
 # ---------------------------------------------------------------------------
 # モデルを差し替えるたびに BASE_MODEL / NUM_CTX / CODEX_TOOL_REPAIR /
@@ -103,8 +124,18 @@ export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 
 # T4 (sm_75) は bf16 非対応。GGUF 量子化で回避する。
-export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
-export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+#
+# ★ この 2 つは GPU 前提の設定なので、CPU では既定を変える。
+#   Ollama の KV キャッシュ量子化（q8_0）は FlashAttention が有効なときにしか
+#   効かず、CPU バックエンドでは FlashAttention が使えない。GPU 用の値を
+#   そのまま渡すと、効かないか警告で埋まるだけで得が無い。
+if [ "$ACCEL" = "cpu" ]; then
+  export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
+  export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-f16}"
+else
+  export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+  export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+fi
 # ★重要: Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
 #   モデルのロード時間がその 30 秒に食い込むと確実に落ちるので、絶対にアンロードさせない。
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
@@ -195,6 +226,35 @@ model_profile_banner() {
 ensure_dirs() { mkdir -p "$LOGDIR" "$WORKSPACE" "$STATEDIR"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- アクセラレータごとのメモリ問い合わせ ----------------------------------
+# GPU なら VRAM、CPU ならシステム RAM を見る。20_ollama.sh / 10_preflight.sh の
+# 両方が同じ判断を必要とするので、分岐をここ 1 か所に閉じ込める。
+
+# accel_mem_label — 出力やログに出す名前（"VRAM" / "RAM"）
+accel_mem_label() { [ "$ACCEL" = "cpu" ] && echo RAM || echo VRAM; }
+
+# accel_free_mib — 今すぐモデルに使える空きメモリを MiB で返す
+#
+# CPU 側で free の "free" ではなく "available" を使うのは、ページキャッシュに
+# 使われている分は回収できるため。"free" を見ると実際より少なく出て、
+# 載るモデルまで NG と判定してしまう。
+accel_free_mib() {
+  if [ "$ACCEL" = "cpu" ]; then
+    awk '/^MemAvailable:/ {printf "%d\n", $2 / 1024}' /proc/meminfo
+  else
+    nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1
+  fi
+}
+
+# accel_mem_report — 現在のメモリ状況を数行で出す（末尾の実測用）
+accel_mem_report() {
+  if [ "$ACCEL" = "cpu" ]; then
+    free -m | awk '/^Mem:/ {printf "total %s MiB, used %s MiB, available %s MiB\n", $2, $3, $7}'
+  else
+    nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader
+  fi
+}
 
 # first_line <コマンド...> — 版数などを 1 行だけ安全に取り出す。
 #
