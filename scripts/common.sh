@@ -90,6 +90,37 @@ case "$MODEL_PROFILE" in
     _p_base="gpt-oss:20b"; _p_ctx=16384; _p_repair=1; _p_rules=minimal; _p_kv=0.024
     _p_note="MXFP4 MoE。T4 で実機確認済み（100% GPU, 34.5 tok/s）。ollama#17638 対策で再送プロキシ経由"
     ;;
+  gemma4-12b-qat)
+    # Gemma 4 12B QAT（2026-06-03 公開）。11.95B params / 48 層 / 256K ctx。
+    # Google が QAT (quantization-aware training) した q4_0 で、ollama 公称
+    # 約 7.2GB。T4 の空き（実測 14913 MiB ≒ 14.56 GiB）に対して余裕がある。
+    #
+    # ★ Gemma は一度却下している（docs/リモート化計画.md §0.3）。理由は
+    #   「Gemma 3 は Ollama のテンプレートに tool calling が入っていない」。
+    #   Gemma 4 では capabilities に tools が入ったので再評価する。
+    #
+    # ★ ただし tool calling に別系統の既知不具合が 2 つ報告されている。
+    #   §5.6 / §5.8 / §12.7 で踏んできたのと同じ「tool_calls に入らず
+    #   content に漏れる」クラスで、だから _p_repair=1 で始める:
+    #     - ollama/ollama#15539 … system prompt + think:false + tools を
+    #       同時に送るとパーサが取りこぼし、content に
+    #       {"tool_calls":[{"function":N,"args":{}}]} + <channel|> が落ちる
+    #     - ollama/ollama#15798 … <|tool_call|> / <|"|> / <|channel|> 等の
+    #       テンプレート特殊トークンが本文にそのまま漏れる。
+    #       finish_reason は stop なのでクライアントは気付かない。
+    #       Closed as not planned（上流の修正見込み無し）
+    #   どちらも 12b-it-qat での報告ではない（e4b / gemma4-64k）。
+    #   実際にどうなるかは scripts/34_toolcall_probe.sh で確定させる。
+    #
+    # ★ _p_kv は **未実測の暫定値**。Gemma 4 は局所 1024 の sliding window と
+    #   大域 attention を交互に使う（最終層は大域）ため、既存プロファイルの
+    #   「層数 × KV ヘッド × head_dim」をそのまま当てると大きく過大評価になる。
+    #   一方で Ollama が実際にどう確保するかは実機で見ないと分からないので、
+    #   ここでは 12B 級の安全側に倒してある。34_toolcall_probe.sh が採る
+    #   `ollama show --modelfile` の値で置き換えること。
+    _p_base="gemma4:12b-it-qat"; _p_ctx=16384; _p_repair=1; _p_rules=minimal; _p_kv=0.05
+    _p_note="Gemma 4 12B QAT。tool calling に既知の不具合（ollama#15539/#15798）→ 修復プロキシ既定 ON。KV は未実測の暫定値"
+    ;;
   qwen25-coder-14b)
     # 評価対象からは外したが、§5.8 / §5.8.1 の再現用に定義だけ残す。
     # このモデルだけは修復プロキシと apply_patch 回避ルールが要る。
@@ -100,7 +131,7 @@ case "$MODEL_PROFILE" in
     ;;
   *)
     printf '\033[31m[FATAL]\033[0m MODEL_PROFILE=%s は未知です。\n' "$MODEL_PROFILE" >&2
-    printf '        使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / qwen25-coder-14b\n' >&2
+    printf '        使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / gemma4-12b-qat / qwen25-coder-14b\n' >&2
     printf '        （未指定なら従来の既定値で動きます）\n' >&2
     exit 1
     ;;

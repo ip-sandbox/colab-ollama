@@ -32,7 +32,7 @@ usage() {
                          招くおそれがある。--retry 3〜5 程度にとどめ、
                          取れなければ時間をおいて出直すほうが安全
   --profile NAME       MODEL_PROFILE（qwen3-8b / qwen3-14b / gpt-oss-20b /
-                       qwen25-coder-14b）。省略時は VM 側の既定値
+                       gemma4-12b-qat / qwen25-coder-14b）。省略時は VM 側の既定値
   --attach             セットアップ後そのまま codex TUI に入る
   --eval N             評価タスクを N 回走らせて結果を表で出す（非対話）
   --prompt TEXT        --eval で投げるプロンプト
@@ -100,9 +100,9 @@ fi
 # プロファイル名も手元で検証する。VM を確保してから typo で落ちると
 # 10 分と課金を無駄にするため。一覧は scripts/common.sh と揃えること。
 case "${MODEL_PROFILE:-}" in
-  ""|qwen3-8b|qwen3-14b|gpt-oss-20b|qwen25-coder-14b) ;;
+  ""|qwen3-8b|qwen3-14b|gpt-oss-20b|gemma4-12b-qat|qwen25-coder-14b) ;;
   *) usage_error "--profile が不正です: $MODEL_PROFILE
-    使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / qwen25-coder-14b" ;;
+    使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / gemma4-12b-qat / qwen25-coder-14b" ;;
 esac
 
 # アクセラレータ名も同様（colab CLI は未知の値を黙って A100 に読み替える）
