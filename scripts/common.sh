@@ -99,9 +99,27 @@ case "$MODEL_PROFILE" in
     #   「Gemma 3 は Ollama のテンプレートに tool calling が入っていない」。
     #   Gemma 4 では capabilities に tools が入ったので再評価する。
     #
-    # ★ ただし tool calling に別系統の既知不具合が 2 つ報告されている。
-    #   §5.6 / §5.8 / §12.7 で踏んできたのと同じ「tool_calls に入らず
-    #   content に漏れる」クラスで、だから _p_repair=1 で始める:
+    # ★★ 2026-09-18 実機検証: tool calling は **正しく動く**。
+    #   Colab CPU ランタイム / Ollama 0.34.2 / gemma4:12b-it-qat で、
+    #   /api/chat（think 既定）・/api/chat（think:false）・/v1/responses の
+    #   3 経路すべてが正しい tool_calls を返した。content への漏出はゼロ:
+    #       tool_calls: [write_file]
+    #       arguments : {"content":"hi","path":"hello.txt"}
+    #   下記 2 つの issue はいずれも **この版では再現しない**。
+    #   理由は Modelfile の `RENDERER gemma4` / `PARSER gemma4` にある。
+    #   Ollama 0.30.5+ は gemma4 を Jinja ではなくネイティブ実装で扱うため、
+    #   テンプレートが {{ .Prompt }}（素通し）に見えるが、これは正常。
+    #
+    #   そのため **_p_repair=0** にしてある。壊れていないモデルに修復プロキシを
+    #   噛ませても益は無く、ストリーミング表示を 1 チャンクに潰す副作用だけが残る
+    #   （qwen3 系・gpt-oss と同じ判断）。修復コード自体は残してある。上流の版が
+    #   変われば再発しうるし、scripts/34_toolcall_probe.sh で再確認できる。
+    #
+    #   ※ 副作用として、プロキシ経由だと Codex の stream_idle_timeout_ms が
+    #     効かなくなる（手順書 §7）。CPU で極端に遅く、生成中に切られる場合は
+    #     あえて _p_repair=1 に戻す、という使い方はありうる。
+    #
+    # 参考（この版では再現しなかった既知不具合）:
     #     - ollama/ollama#15539 … system prompt + think:false + tools を
     #       同時に送るとパーサが取りこぼし、content に
     #       {"tool_calls":[{"function":N,"args":{}}]} + <channel|> が落ちる
@@ -109,8 +127,8 @@ case "$MODEL_PROFILE" in
     #       テンプレート特殊トークンが本文にそのまま漏れる。
     #       finish_reason は stop なのでクライアントは気付かない。
     #       Closed as not planned（上流の修正見込み無し）
-    #   どちらも 12b-it-qat での報告ではない（e4b / gemma4-64k）。
-    #   実際にどうなるかは scripts/34_toolcall_probe.sh で確定させる。
+    #   どちらも 12b-it-qat での報告ではなく（e4b / gemma4-64k）、
+    #   実機では再現しなかった（上記）。
     #
     # ★ KV の実寸（2026-09-18、GGUF メタデータから確定。もう推定ではない）:
     #     48 層 = SWA 40 + 大域 8（SWA×5 + 大域×1 の繰り返し）
@@ -128,11 +146,17 @@ case "$MODEL_PROFILE" in
     #   無かった場合に 3 倍以上楽観で、載らないものを OK と誤判定する向きに
     #   外れていた。
     #
-    #   単位系は既存プロファイルに合わせて **q8_0 想定**。CPU では
-    #   OLLAMA_KV_CACHE_TYPE=f16 になるので実際は倍かかる。CPU で回すときは
-    #   NUM_CTX=8192 程度まで落とすこと（PLAN.md の L2）。
-    _p_base="gemma4:12b-it-qat"; _p_ctx=32768; _p_repair=1; _p_rules=minimal; _p_kv=0.164
-    _p_note="Gemma 4 12B QAT（重み実測 6653 MiB）。tool calling に既知の不具合（ollama#15539/#15798）→ 修復プロキシ既定 ON。KV は実測値（SWA 頭打ち無しの安全側）"
+    #   単位系は既存プロファイルに合わせて **q8_0 想定**。
+    #
+    #   ★ 2026-09-18 実測（Colab CPU / f16 / api/ps の size から重み 6820 MiB を引いた値）:
+    #       ctx= 2,048 -> KV+バッファ 1,286 MiB
+    #       ctx= 8,192 -> KV+バッファ 1,997 MiB
+    #       ctx=32,768 -> KV+バッファ 3,630 MiB
+    #     傾きは 0.066〜0.116 MiB/token で、頭打ち無しの理論値（f16 0.328）より
+    #     大幅に低い。安全側の 0.164 は実際より多めに見積もる方向なので妥当。
+    #     **ctx=32768 は RAM 12GB の CPU 機で実際に載った**（合計 10,450 MiB）。
+    _p_base="gemma4:12b-it-qat"; _p_ctx=32768; _p_repair=0; _p_rules=minimal; _p_kv=0.164
+    _p_note="Gemma 4 12B QAT。tool calling は実機で正常確認済み（Ollama 0.34.2 のネイティブ PARSER）。修復プロキシ不要"
     ;;
   qwen25-coder-14b)
     # 評価対象からは外したが、§5.8 / §5.8.1 の再現用に定義だけ残す。

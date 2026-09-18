@@ -214,12 +214,38 @@ print(json.dumps({
 }))
 PY
 
+# ★ 上限を固定の 900 にしてはいけない。CPU 実行では足りない。
+#   2026-09-18 実測（Colab CPU ランタイム 2 コア / gemma4:12b-it-qat）:
+#     prefill 4.0 tok/s、generation 1.04 tok/s
+#   このベンチは約 4,000 トークンの prefill と 256 トークン生成なので、
+#   900 秒では終わらず curl(28) で落ち、セットアップ全体が失敗していた。
+#   CPU では既定を大きく取り、なお超えたら「遅すぎる」ことを結論として扱う。
+BENCH_MAX_SEC="${BENCH_MAX_SEC:-$([ "$ACCEL" = "cpu" ] && echo 3600 || echo 900)}"
+log "ベンチの上限: ${BENCH_MAX_SEC}s（ACCEL=$ACCEL）"
+
 BENCH_START=$(date +%s)
-curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
+set +e
+curl -fsS --max-time "$BENCH_MAX_SEC" "$OLLAMA_BASE_URL/api/generate" \
      -H 'Content-Type: application/json' \
      --data-binary "@$STATEDIR/bench-req.json" -o "$STATEDIR/bench-resp.json"
+BENCH_RC=$?
+set -e
 BENCH_END=$(date +%s)
 
+# ★ ベンチが終わらなくてもセットアップ全体を失敗させない。
+#   ベンチは「この構成の速度を知る」ための計測であって、環境構築の必須段ではない。
+#   ここで die すると、モデルもエージェントも揃っているのに全部やり直しになる
+#   （実機で踏んだ: CPU で 900 秒を超えて 00_setup_all.sh ごと失敗した）。
+if [ "$BENCH_RC" -ne 0 ]; then
+  warn "ベンチが ${BENCH_MAX_SEC}s 以内に終わりませんでした (curl exit=$BENCH_RC)。
+       この構成は**このベンチを完走できないほど遅い**という結論になります。
+       モデルとエージェントの導入自体は完了しているので、続行します。
+       速度を測り直すなら BENCH_MAX_SEC を伸ばしてください。"
+  printf '%s\n' "ベンチ未完了（${BENCH_MAX_SEC}s 超過）" >"$STATEDIR/bench-summary.txt"
+  printf '{"verdict":"TIMEOUT","bench_max_sec":%s}\n' "$BENCH_MAX_SEC" >"$STATEDIR/bench.json"
+fi
+
+if [ "$BENCH_RC" -eq 0 ]; then
 python3 - "$STATEDIR/bench-resp.json" "$((BENCH_END - BENCH_START))" \
          "$CLINE_REQUEST_BUDGET_SEC" "$NUM_CTX" "$STATEDIR/bench.json" <<'PY' \
   | tee "$STATEDIR/bench-summary.txt"
@@ -323,6 +349,7 @@ with open(out_path, "w", encoding="utf-8") as f:
                "safe_prompt_tokens": safe_tokens, "verdict": verdict,
                "typical_out_tokens": TYPICAL_OUT, "thinking_detected": thinking}, f)
 PY
+fi
 
 hdr "8. $MEM_LABEL 実測"
 accel_mem_report | sed 's/^/      /'
