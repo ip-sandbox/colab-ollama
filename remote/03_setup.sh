@@ -4,7 +4,7 @@
 # Ollama の導入とモデルの pull で 10〜20 分かかる。素朴に ssh の前景で流すと、
 # 途中で接続が切れた時点で全部やり直しになる。
 #
-# そこで VM 側では nohup で切り離して走らせ、手元は tail -f でログを眺めるだけに
+# そこで VM 側では nohup で切り離して走らせ、手元はログを追いかけるだけに
 # する。手元が切れてもセットアップは VM 上で走り続け、もう一度このスクリプトを
 # 叩けば走っているものに合流する。
 #
@@ -73,8 +73,32 @@ hdr "3. ログ"
 log "Ctrl-C で見るのをやめても、VM 側の処理は止まりません。"
 log "再度見るには、このスクリプトをもう一度実行してください。"
 echo
-# sed /SENTINEL/q はセンチネル行を出力してから終了する。tail は SIGPIPE で落ちる。
-rsh "tail -n +1 -f '$SETUP_LOG' 2>/dev/null" | sed "/$SENTINEL/q" || true
+# ★ tail -f | sed /SENTINEL/q は使わないこと（実機で 30 分ハングした）。
+#
+#   sed はセンチネル行を出して正しく終了する。問題は左側で、SIGPIPE は
+#   「次に書き込んだとき」にしか配送されない。セットアップが終わるとログは
+#   静かになるので、ssh/tail は二度と書き込まず、シグナルを受け取る機会が
+#   ないまま待ち続ける。ログが流れ続ける状況でしか成立しない書き方だった。
+#
+#   代わりに VM 側でポーリングし、センチネルを見たら *リモート側から* 抜ける。
+#   ssh の終了がリモートコマンドの終了で決まるので、SIGPIPE に依存しない。
+#   追従の遅れは最大 2 秒。
+#
+#   無限待ちも避ける（センチネルを書かずに死んだ場合）。上限を超えたら
+#   何も出さずに抜け、手順 4 の「まだ終わっていない」分岐に落ちる。
+WAIT_MAX="${SETUP_WAIT_MAX:-5400}"
+rsh "N=0; ELAPSED=0
+     while :; do
+       T=\$(wc -l < '$SETUP_LOG' 2>/dev/null || echo 0)
+       if [ \"\$T\" -gt \"\$N\" ]; then
+         sed -n \"\$((N + 1)),\${T}p\" '$SETUP_LOG' 2>/dev/null
+         N=\$T
+       fi
+       grep -q '$SENTINEL' '$SETUP_LOG' 2>/dev/null && break
+       [ \"\$ELAPSED\" -ge $WAIT_MAX ] && break
+       sleep 2
+       ELAPSED=\$((ELAPSED + 2))
+     done" || true
 
 hdr "4. 結果"
 EXIT_LINE="$(rsh "grep -h '$SENTINEL' '$SETUP_LOG' 2>/dev/null | tail -1" || true)"

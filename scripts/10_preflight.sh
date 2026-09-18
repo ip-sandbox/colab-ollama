@@ -12,8 +12,11 @@ if ! have nvidia-smi; then
   die "nvidia-smi がありません。ランタイムのタイプが GPU になっていない可能性があります。
      Colab メニュー: ランタイム > ランタイムのタイプを変更 > ハードウェア アクセラレータ = T4 GPU"
 fi
+# ★ 出力する項目名も併記すること。ヘッダ無しの CSV だと remote/01_new.sh が
+#   出す memory.free と見分けが付かず、「空き 0 MiB」と読み違える（実際にやった）。
 nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version \
-           --format=csv,noheader | sed 's/^/    /'
+           --format=csv,noheader \
+  | sed 's/^/    /; s/$/  (name, total, used, driver)/'
 
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 VRAM_TOTAL_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)"

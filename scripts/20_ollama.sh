@@ -110,7 +110,21 @@ if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$BASE_MODEL"; then
   ok "取得済み: $BASE_MODEL"
 else
   log "pull します: $BASE_MODEL"
-  warn "14B q4_K_M で約 9GB。回線次第で数分〜十数分かかります。"
+  # ★ サイズをモデル決め打ちで書かないこと。以前は「14B q4_K_M で約 9GB」と
+  #   固定文言だったため、gpt-oss:20b を pull している最中に 14B の話が出た。
+  #   手順 3 の事前チェックが実測値を JSON に残しているので、それを使う。
+  PULL_GIB="$(python3 -c "
+import json, sys
+try:
+    print('%.1f' % (json.load(open('$STATEDIR/vram-precheck.json'))['weights_mib'] / 1024))
+except Exception:
+    print('')
+" 2>/dev/null)"
+  if [ -n "$PULL_GIB" ]; then
+    warn "重みは約 ${PULL_GIB}GB です。回線次第で数分〜十数分かかります。"
+  else
+    warn "重みを丸ごと落とします。回線次第で数分〜十数分かかります。"
+  fi
   ollama pull "$BASE_MODEL"
   ok "pull 完了: $BASE_MODEL"
 fi
