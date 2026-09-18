@@ -105,9 +105,14 @@ _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 #       <|turn>          … <turn|>
 #       <|tool>          … <tool|>
 #       <|"|>            （これだけ対称。文字列の引用に使う）
+#   36_registry_probe.py がテンプレートから実際に拾ったトークンの全体:
+#       <|tool_call> <|tool_response> <|channel> <|turn> <|tool>   （開き・非対称）
+#       <tool_call|> <tool_response|> <channel|> <turn|> <tool|>   （閉じ・非対称）
+#       <|"|> <|think|> <|image|> <|audio|> <|video|>              （対称）
 _GEMMA_TOKEN_RE = re.compile(
-    r"<\|(?:tool_call|tool_response|channel|turn|tool|image)>"
-    r"|</?(?:tool_call|tool_response|channel|turn|tool)\|>"
+    r"<\|(?:tool_call|tool_response|channel|turn|tool)>"
+    r"|<(?:tool_call|tool_response|channel|turn|tool)\|>"
+    r"|<\|(?:think|image|audio|video)\|>"
 )
 _GEMMA_QUOTE = '<|"|>'
 _GEMMA_QUOTE_RE = re.compile(re.escape(_GEMMA_QUOTE))

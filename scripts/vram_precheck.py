@@ -43,8 +43,13 @@ import urllib.error
 import urllib.request
 
 REGISTRY = "https://registry.ollama.ai/v2"
-# マニフェストの中で「重みの実体」を指すレイヤの mediaType
-MODEL_LAYER_SUFFIX = "image.model"
+# マニフェストの中で「メモリに載るもの」を指すレイヤの mediaType。
+# ★ image.model だけでは足りない。マルチモーダルのモデルは image.projector
+#   （画像/音声の投影層）を別レイヤで持ち、これも一緒にロードされる。
+#   gemma4:12b-it-qat は model 6653 MiB + projector 167 MiB。
+#   projector を数えていなかったので 167 MiB 過小評価していた（2026-09-18 修正）。
+#   投影層の大きいモデルではもっと効く。
+WEIGHT_LAYER_SUFFIXES = ("image.model", "image.projector")
 # 余裕がこれ未満なら WARN（進めるが、長い文脈で OOM しうる）
 WARN_MARGIN_MIB = 512
 
@@ -78,14 +83,20 @@ def fetch_weights_mib(model: str) -> float:
         print(f"      レジストリに到達できませんでした: {e}")
         sys.exit(3)
 
-    total = sum(
-        layer.get("size", 0)
-        for layer in manifest.get("layers", [])
-        if layer.get("mediaType", "").endswith(MODEL_LAYER_SUFFIX)
-    )
+    parts = {}
+    for layer in manifest.get("layers", []):
+        mt = layer.get("mediaType", "")
+        for suffix in WEIGHT_LAYER_SUFFIXES:
+            if mt.endswith(suffix):
+                parts[suffix] = parts.get(suffix, 0) + layer.get("size", 0)
+    total = sum(parts.values())
     if not total:
         print("      マニフェストに重みレイヤがありません。判定できません。")
         sys.exit(3)
+    # 内訳を出す。projector があるかどうかは「マルチモーダルか」の目印にもなる。
+    if len(parts) > 1:
+        for suffix, size in sorted(parts.items()):
+            print(f"        {suffix:18}: {size / 1024 ** 2:8.0f} MiB")
     return total / (1024**2)
 
 
