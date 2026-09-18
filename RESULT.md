@@ -975,3 +975,115 @@ Ollama 0.30.5+ は gemma4 を Jinja ではなく**ネイティブ実装**で扱�
   30 秒の壁が無いことは実証済みなので動くはずだが、実タスクでは未確認
 - n=5 では 5/5 と 4/5 の差は判定できない（§7.2 と同じ限界）
 - 修復プロキシの Gemma 4 用パーサは**依然として一度も発火していない**
+
+---
+
+# 追記 (2026-09-18 その 5): Cline での実タスク — 5/5 完走、ただし致命的な設定バグを 1 件発見
+
+手順: 手順書 §6.1 の訂正 / §5.10
+
+## 環境
+
+- T4（再試行 1 回目で確保）/ `gemma4:12b-it-qat` / `num_ctx=32768`
+- Cline CLI **3.0.62**、`CLINE_PROVIDER=ollama`
+- プロンプト・回数・判定基準は Codex の `--eval` と**完全に同一**
+  （`pythonでfizzbuzzを書いてテストして。` × 5、`fizzbuzz.py` が 50B 以上かつ exit 0）
+- **VM は検証後に停止済み（サーバ側の一覧が空であることを確認）**
+
+## 1. ★ `50_run.sh` はローカルの Ollama を使えていなかった
+
+最初の 5 回は **5/5 が 3〜7 秒で失敗**した。
+
+```
+error: Unauthorized: Please make sure you're using the latest version of
+       Cline and re-authenticate your Cline account.
+```
+
+`providers.json` は正しかった:
+
+```json
+{"version":1,"lastUsedProvider":"ollama","modes":{},
+ "providers":{"ollama":{"settings":{"provider":"ollama","apiKey":"ollama","model":"cline-coder"}}}}
+```
+
+原因は `cline --help` にあった:
+
+```
+-P, --provider <id>    Provider id (default: cline)
+```
+
+**セッションの既定プロバイダは `cline`（クラウド）で、`lastUsedProvider` は
+参照されない。** `cline auth -p ollama ...` は設定を書くだけで、実行時に `-P` を
+渡さなければローカルには繋がらない。
+
+`-P ollama -m cline-coder` を足して同じ条件で投げたら、**64 秒で完走**した。
+
+### なぜ厄介か
+
+手順書 §6.1 は「既定はクラウド — ここを必ず確認する」と警告しており、
+方向は正しかった。しかし対策として書いていた「`providers.json` を目視確認する」
+では**この問題は防げない**。設定ファイルは正しいまま、実行時にクラウドへ行く。
+
+しかも症状が「認証エラー」なので、プロバイダ選択の問題だと気づきにくい。
+モデルもポートも正常で、3〜7 秒で即座に終わる。
+
+`scripts/50_run.sh` を直し、`-P` / `-m` を必ず渡すようにした。
+手順書 §6.1 に訂正を入れ、手で叩く場合も `-P` が要ることを明記した。
+
+## 2. 修正後: 5/5 完走、テスト実行も 5/5
+
+| 試行 | 結果 | 所要 | 生成物 | テスト実行 |
+|---|---|---:|---|---|
+| 1 | OK | 61s | fizzbuzz.py(277B) + test_fizzbuzz.py(528B) | `Ran 1 test ... OK` |
+| 2 | OK | 62s | fizzbuzz.py(277B) + test_fizzbuzz.py(528B) | `Ran 1 test ... OK` |
+| 3 | OK | 58s | fizzbuzz.py(413B) + test_fizzbuzz.py(615B) | `Ran 2 tests ... OK` |
+| 4 | OK | 67s | fizzbuzz.py(287B) + test_fizzbuzz.py(795B) | `Ran 4 tests ... OK` |
+| 5 | OK | 237s | fizzbuzz.py(401B) + test_fizzbuzz.py(839B) | `Ran 4 tests ... OK` |
+
+**5/5 完走、5/5 でテストも実際に実行された**（ログで確認、自己申告ではない）。
+
+### Codex との比較（同一 T4・同一プロンプト・同一判定）
+
+| | Codex CLI | Cline CLI |
+|---|---|---|
+| 完走 | 5/5 | 5/5 |
+| テスト生成 | 4/5 | **5/5** |
+| テスト実行の痕跡 | 3/5 | **5/5** |
+| 所要 | 37〜92s | 58〜237s |
+
+**Cline のほうが成果物の質は高い**（テストを必ず書いて実行する）。
+所要は Cline のほうが長く、試行 5 は 237 秒かかった。
+
+## 3. ★ 30 秒タイムアウトが存在しないことの実地証明
+
+試行 5 の **237 秒**が、§7 の訂正を実タスクで裏づけている。
+30 秒制限が生きていれば、この試行は途中で切られていたはずである。
+5 回中 5 回が 58 秒以上かかっており、**すべて旧来の 30 秒予算を超えている**。
+
+## 4. ベンチ判定が実測と一致するようになった
+
+`CLINE_REQUEST_BUDGET_SEC` を 300 に直した効果が出た。今回のセットアップでは:
+
+```
+prompt eval : 13181 tok / 19.8s = 666 tok/s
+generation  : 256 tok / 15.9s = 16.1 tok/s
+★ 安全に投げられるプロンプト長 : 約 179,092 トークン
+判定: OK
+```
+
+前回（30 のまま）は同じ構成で「安全プロンプト長 約 0 トークン / 判定 NG」だった。
+実タスクが 5/5 完走する構成に対して OK が出るようになり、矛盾が解消した。
+
+## 5. providers.json のパス修正に漏れがあった（修正済み）
+
+`90_healthcheck.sh` だけ旧パス（`data/settings/`）決め打ちのままで、
+`/root/.cline/data/settings/providers.json が無い` と誤報していた。
+`cline_providers_json()` を使うように直した。
+
+## 測っていないこと
+
+- **`num_ctx` の実上限。** 32768 までしか試していない（VRAM に 7GB 以上の余裕あり）
+- `CLINE_PROVIDER=openai-compatible` 経路での実タスク。`-P openai-compatible` で
+  動くはずだが未確認
+- n=5 では Codex と Cline の差（3/5 対 5/5 のテスト実行率）は統計的に判定できない
+- 修復プロキシの Gemma 4 用パーサは**依然として一度も発火していない**

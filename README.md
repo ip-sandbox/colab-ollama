@@ -173,8 +173,10 @@ SKIP_MODEL=1 bash scripts/60_cpu_verify.sh
   守るが、`editor` の引数を安定して組み立てられず無限ループに陥ることがある
   （既知の症状、手順書 §5.6・§5.7）
 - **`num_ctx` を Modelfile に焼き込む。** 既定のままだと Cline は静かに壊れる
-- **Cline CLI は既定でクラウドに投げる。** `providers.json` の中身を必ず目視確認する
-  （`cline config` は CLI 3.x で対話専用になり、TTY が無いと使えない）
+- **Cline CLI は既定でクラウドに投げる。★ `providers.json` を見るだけでは防げない。**
+  セッションの既定プロバイダは `cline`（クラウド）で、`lastUsedProvider` は
+  参照されない。実行時に `-P ollama -m cline-coder` を渡さないと、設定が正しくても
+  `Unauthorized` で 3〜7 秒で落ちる。`50_run.sh` は渡すように修正済み。手順書 §6.1
 - **日本語プロンプトは引数ではなく標準入力で渡す。** Cline CLI 3.x はコマンドライン
   引数に非 ASCII 文字（日本語含む）が入ると `Unknown command or unquoted prompt`
   で必ず失敗するバグがある。`50_run.sh` は標準入力経由に変更済み。手順書 §7.2
