@@ -21,7 +21,9 @@ scripts/test_harmony_e2e_stub.py と役割が違う点
 あちらは Codex CLI 用で `/v1/responses` しか喋らない。Cline は
 Ollama ネイティブ API（`/api/tags`, `/api/chat`）か OpenAI 互換
 （`/v1/chat/completions`）を使うので、同じスタブには乗らない。
-こちらは **3 つの API 形状すべて** に応え、どれが叩かれたかを記録する。
+こちらは **4 つの API 形状すべて** に応え、どれが叩かれたかを記録する
+（Ollama ネイティブ / OpenAI 互換 chat / OpenAI 互換 responses / 探索系）。
+`/v1/responses` があるのは Codex CLI 0.15x がそれしか喋らないため。
 
 環境変数
 --------
@@ -34,6 +36,15 @@ Ollama ネイティブ API（`/api/tags`, `/api/chat`）か OpenAI 互換
                   最初の 1 バイトを送る前に待つ。prefill が長いときの
                   見え方と同じにするため
   STUB_MODEL      名乗るモデル名（既定 cline-coder）
+  STUB_STALL_MODE 沈黙のさせ方（既定 ttfb）
+                    ttfb … 最初の 1 バイトまで STUB_DELAY_SEC 待つ
+                            （= 上流がまったく応答しない状態）
+                    gap  … ヘッダと最初のイベントは即返し、**その後**
+                            STUB_DELAY_SEC 沈黙してから完了イベントを返す
+                  ★ この 2 つを撃ち分けないと、クライアントの
+                    「idle timeout」が *初回バイトまで* を縛るのか
+                    *イベント間の間隔* を縛るのかが分からない。
+                    実際 Codex CLI 0.155.1 は前者を縛らなかった。
   STUB_LOG        リクエストの記録先（既定 /tmp/slow-upstream-requests.jsonl）
 
 使い方
@@ -54,6 +65,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("STUB_PORT", "11434"))
 DELAY_SEC = float(os.environ.get("STUB_DELAY_SEC", "45"))
 MODEL = os.environ.get("STUB_MODEL", "cline-coder")
+STALL_MODE = os.environ.get("STUB_STALL_MODE", "ttfb")
 LOG_PATH = os.environ.get("STUB_LOG", "/tmp/slow-upstream-requests.jsonl")
 
 # 応答本文。ツール呼び出しはさせない（ここで測りたいのは時間だけ）。
@@ -157,6 +169,26 @@ def _openai_chat() -> dict:
     }
 
 
+def _openai_responses() -> dict:
+    """Codex CLI 0.15x 系が喋る /v1/responses の形。
+
+    test_harmony_e2e_stub.py が返す形に合わせてある（あちらは harmony 修復の
+    検証用、こちらは遅延の検証用で、役割だけが違う）。
+    """
+    return {
+        "id": "resp_stub",
+        "object": "response",
+        "status": "completed",
+        "model": MODEL,
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": REPLY_TEXT}],
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+    }
+
+
 class Stub(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -205,6 +237,45 @@ class Stub(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_chunked_stream(self, first: bytes, rest: bytes, gap: float) -> None:
+        """ヘッダと first を即送り、gap 秒沈黙してから rest を送る。
+
+        Content-Length を先に決められないので chunked で送る。
+        これが「イベント間の間隔」を作る唯一の方法で、
+        idle timeout の意味を切り分けるために要る。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def chunk(b: bytes) -> bytes:
+            return f"{len(b):x}\r\n".encode() + b + b"\r\n"
+
+        self.wfile.write(chunk(first))
+        self.wfile.flush()
+        print(f"[stub] 最初のイベントを送信。{gap}s 沈黙します", flush=True)
+        time.sleep(gap)
+        self.wfile.write(chunk(rest))
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def _send_responses_stream(self, obj: dict) -> None:
+        ev = [
+            ("response.created", {"type": "response.created", "response": {"id": obj["id"]}}),
+            ("response.completed", {"type": "response.completed", "response": obj}),
+        ]
+        body = b"".join(
+            f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+            for name, payload in ev
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # --- ルーティング ------------------------------------------------------
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -235,12 +306,33 @@ class Stub(BaseHTTPRequestHandler):
 
         # ここからが本番。推論リクエストだけを遅らせる。
         _record("POST", path, body, delayed=True)
+        stream = bool(body.get("stream"))
+
+        # gap モードは「最初のイベントを即返してから沈黙」なので、
+        # ここでは待たずにストリーム送信側で待つ。ストリームでない
+        # リクエストには間隔という概念が無いので ttfb と同じ扱いにする。
+        if STALL_MODE == "gap" and stream and path.startswith("/v1/responses"):
+            obj = _openai_responses()
+            first = (b"event: response.created\ndata: "
+                     + json.dumps({"type": "response.created",
+                                   "response": {"id": obj["id"]}}).encode() + b"\n\n")
+            rest = (b"event: response.completed\ndata: "
+                    + json.dumps({"type": "response.completed",
+                                  "response": obj}).encode() + b"\n\n")
+            try:
+                self._send_chunked_stream(first, rest, DELAY_SEC)
+            except BrokenPipeError:
+                print("[stub] クライアントが沈黙中に切断しました（idle timeout 発火）",
+                      flush=True)
+            return
+
         print(f"[stub] -> {DELAY_SEC}s 待ってから応答します", flush=True)
         time.sleep(DELAY_SEC)
-
-        stream = bool(body.get("stream"))
         try:
-            if path.startswith("/v1/chat/completions"):
+            if path.startswith("/v1/responses"):
+                self._send_responses_stream(_openai_responses()) if stream \
+                    else self._send_json(_openai_responses())
+            elif path.startswith("/v1/chat/completions"):
                 self._send_openai_stream(_openai_chat()) if stream \
                     else self._send_json(_openai_chat())
             elif path.startswith("/api/chat") or path.startswith("/api/generate"):

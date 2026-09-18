@@ -198,6 +198,7 @@ scripts/33_patch_cline_timeout.sh Cline の Ollama タイムアウト上限を�
 scripts/34_toolcall_probe.sh   tool_calls が本当に返るかを証拠付きで確かめる（§5.10）
 scripts/35_cline_timeout_probe.sh Cline が何秒で切るかをモデル無しで実測する（§7）
 scripts/36_registry_probe.py    pull せずにテンプレートと KV の実寸を調べる（§5.10）
+scripts/37_codex_timeout_probe.sh Codex が何秒で切るかをモデル無しで実測する（§7）
 scripts/40_terminal_setup.sh   ターミナル用の ~/.bashrc 整備
 scripts/50_run.sh              セルから Cline を走らせるラッパ
 scripts/60_cpu_verify.sh       GPU 無しで潰せる検証を一括で通す（手順書 §13）

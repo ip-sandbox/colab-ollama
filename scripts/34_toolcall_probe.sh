@@ -45,6 +45,13 @@ model_profile_banner
 # 既定は Modelfile でラップしたほう（実際にエージェントが使うのはこちら）。
 # 素のベースモデルを見たいときは PROBE_MODEL で上書きする。
 PROBE_MODEL="${PROBE_MODEL:-$CLINE_MODEL}"
+# ★ 生成長の上限。既定で入れているのは CPU 実行のため。
+#   gemma4 は thinking モデルで、放っておくと 1 応答に思考トークンが
+#   数百〜数千乗る。2 vCPU で 12B は 1〜2 tok/s なので、上限が無いと
+#   1 セルで 30 分を超えうる（行列は 7 セルある）。
+#   ここで見たいのは「tool_calls が埋まるか」の 1 点だけなので、
+#   ツール呼び出し 1 個が出れば足りる長さに切る。
+PROBE_NUM_PREDICT="${PROBE_NUM_PREDICT:-256}"
 PROBE_DIR="$STATEDIR/probe"
 SUMMARY="$PROBE_DIR/summary.tsv"
 CURL_MAX="${PROBE_CURL_MAX:-900}"
@@ -59,7 +66,9 @@ ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -q "^${PROBE_MODEL}" \
 ok "対象モデル: $PROBE_MODEL"
 if [ "$ACCEL" = "cpu" ]; then
   warn "CPU モードです。1 リクエストに数分かかることがあります（curl の上限は ${CURL_MAX}s）。
-       ここで測りたいのは速度ではなく、tool_calls が埋まるかどうかです。"
+       ここで測りたいのは速度ではなく、tool_calls が埋まるかどうかです。
+       生成長は num_predict=${PROBE_NUM_PREDICT} に制限しています
+       （thinking モデルは放っておくと際限なく考えます）。"
 fi
 
 hdr "1. モデルの自己申告と実テンプレート"
@@ -148,9 +157,10 @@ for think in unset false; do
   for sys_prompt in with without; do
     label="api-chat.sys-$sys_prompt.think-$think"
     req="$PROBE_DIR/$label.req.json"
-    python3 - "$PROBE_MODEL" "$TOOL_NAME" "$sys_prompt" "$think" >"$req" <<'PY'
+    python3 - "$PROBE_MODEL" "$TOOL_NAME" "$sys_prompt" "$think" \
+             "$PROBE_NUM_PREDICT" >"$req" <<'PY'
 import json, sys
-model, tool, sys_prompt, think = sys.argv[1:5]
+model, tool, sys_prompt, think, num_predict = sys.argv[1:6]
 msgs = []
 if sys_prompt == "with":
     msgs.append({"role": "system",
@@ -173,7 +183,7 @@ body = {
             },
         },
     }],
-    "options": {"temperature": 0},
+    "options": {"temperature": 0, "num_predict": int(num_predict)},
 }
 if think == "false":
     body["think"] = False
@@ -190,9 +200,10 @@ done
 for sys_prompt in with without; do
   label="v1-chat.sys-$sys_prompt"
   req="$PROBE_DIR/$label.req.json"
-  python3 - "$PROBE_MODEL" "$TOOL_NAME" "$sys_prompt" >"$req" <<'PY'
+  python3 - "$PROBE_MODEL" "$TOOL_NAME" "$sys_prompt" \
+           "$PROBE_NUM_PREDICT" >"$req" <<'PY'
 import json, sys
-model, tool, sys_prompt = sys.argv[1:4]
+model, tool, sys_prompt, num_predict = sys.argv[1:5]
 msgs = []
 if sys_prompt == "with":
     msgs.append({"role": "system",
@@ -200,6 +211,7 @@ if sys_prompt == "with":
 msgs.append({"role": "user", "content": "Create a file named hello.txt containing hi."})
 print(json.dumps({
     "model": model, "stream": False, "temperature": 0, "messages": msgs,
+    "max_tokens": int(num_predict),
     "tools": [{
         "type": "function",
         "function": {
@@ -226,11 +238,12 @@ done
 # --- /v1/responses（Codex CLI 0.15x はこれしか喋らない） -------------------
 label="v1-responses"
 req="$PROBE_DIR/$label.req.json"
-python3 - "$PROBE_MODEL" "$TOOL_NAME" >"$req" <<'PY'
+python3 - "$PROBE_MODEL" "$TOOL_NAME" "$PROBE_NUM_PREDICT" >"$req" <<'PY'
 import json, sys
-model, tool = sys.argv[1:3]
+model, tool, num_predict = sys.argv[1:4]
 print(json.dumps({
     "model": model, "stream": False,
+    "max_output_tokens": int(num_predict),
     "instructions": "You are a coding agent. Use the provided tools.",
     "input": "Create a file named hello.txt containing hi.",
     "tools": [{
