@@ -146,6 +146,28 @@ Devstral Small 2 24B Q4 は T4 に **1.5GB 足りず載りません**（無料�
 100% GPU、`codex exec` の実タスク **5/5 完走**）。tool calling も正常なので
 修復プロキシは不要（`CODEX_TOOL_REPAIR=0`）。詳細は手順書 §5.10。
 
+## ブラウザの Colab から gemma4 + Cline を試す
+
+手元に何も入れず、Colab をブラウザで開くだけで試せます。
+**T4 実機で 5/5 完走を確認した手順**です（詳細と実測値は手順書 §4.4）。
+
+```python
+# 1. ランタイム > ランタイムのタイプを変更 > T4 GPU にしてから、セルで:
+!cd /content && git clone https://github.com/ip-sandbox/colab-ollama.git colab-cline
+!cd /content/colab-cline && MODEL_PROFILE=gemma4-12b-qat bash scripts/00_setup_all.sh
+```
+
+約 8 分。終わったらノートブック下部の「ターミナル」ボタンを押して:
+
+```bash
+cd /content/workspace
+cline -P ollama -m cline-coder
+```
+
+> **`-P ollama -m cline-coder` は必須です。** 省くと Cline のクラウドに行き、
+> `Unauthorized` で数秒で落ちます（設定ファイルは正しいままなので気づきにくい）。
+> 手順書 §6.1。
+
 ## GPU が取れないとき
 
 無料枠の T4 は取り合いで、確保できないことのほうが多くあります。
