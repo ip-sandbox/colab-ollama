@@ -118,8 +118,21 @@ case "$MODEL_PROFILE" in
     #   一方で Ollama が実際にどう確保するかは実機で見ないと分からないので、
     #   ここでは 12B 級の安全側に倒してある。34_toolcall_probe.sh が採る
     #   `ollama show --modelfile` の値で置き換えること。
-    _p_base="gemma4:12b-it-qat"; _p_ctx=16384; _p_repair=1; _p_rules=minimal; _p_kv=0.05
-    _p_note="Gemma 4 12B QAT。tool calling に既知の不具合（ollama#15539/#15798）→ 修復プロキシ既定 ON。KV は未実測の暫定値"
+    #
+    # ★ 重みは実測済み（2026-09-18、レジストリのマニフェストから）:
+    #     6653 MiB = 6.50 GiB
+    #   ollama.com の表示は「約 7.2GB」だが、あちらは 10 進の GB。
+    #
+    #   num_ctx=32768 にしているのは、この実測値なら T4 に余裕で載るから。
+    #   空き 14913 MiB に対して:
+    #     ctx=16384, kv=0.05 -> 余裕 +6801 MiB
+    #     ctx=32768, kv=0.05 -> 余裕 +5982 MiB
+    #     ctx=32768, kv=0.15 -> 余裕 +2705 MiB  ← KV を 3 倍に見積もっても載る
+    #     ctx=65536, kv=0.15 -> 余裕 -2210 MiB  ← ここで破綻する
+    #   20_ollama.sh が言うとおり「32768 未満だと Cline はまともに動かない」ので、
+    #   載るなら 16384 に落とす理由が無い。65536 は KV が未実測のうちは危ない。
+    _p_base="gemma4:12b-it-qat"; _p_ctx=32768; _p_repair=1; _p_rules=minimal; _p_kv=0.05
+    _p_note="Gemma 4 12B QAT（重み実測 6653 MiB）。tool calling に既知の不具合（ollama#15539/#15798）→ 修復プロキシ既定 ON。KV は未実測の暫定値"
     ;;
   qwen25-coder-14b)
     # 評価対象からは外したが、§5.8 / §5.8.1 の再現用に定義だけ残す。

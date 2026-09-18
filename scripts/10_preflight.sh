@@ -124,12 +124,33 @@ hdr "7. ネットワーク疎通"
 #   塞がれている環境が実在し（Claude on the web の既定ポリシーがそう）、
 #   その場合は ollama のインストールまで通ってから pull だけが失敗する。
 #   どちらが落ちたのかを区別できないと、原因の切り分けに時間を使う。
+#
+# ★ 「到達できたか」は HTTP ステータスで判断してはいけない。
+#   registry.ollama.ai はルートに GET すると **404 を返すのが正常**
+#   （/v2/<name>/manifests/<tag> しか生えていない）。ここで curl -f を使うと
+#   404 で失敗扱いになり、**実際には pull できる環境を「届きません」と誤判定する**。
+#   実際に踏んだ: レジストリからマニフェストを取得できている機械で
+#   「registry.ollama.ai に届きません」と出た（2026-09-18）。
+#   しかもこの判定は 60_cpu_verify.sh が L2 を飛ばすかどうかに使われるので、
+#   誤判定すると「pull できるのに検証を丸ごと飛ばす」という最悪の方向に倒れる。
+#
+#   欲しいのは「egress ポリシーに塞がれていないか」なので、
+#   **HTTP 応答が返ってきたか** だけを見る。塞がれている場合、curl は
+#   CONNECT の失敗（exit 56）になり http_code は 000 になる。
+#   200 でも 401 でも 404 でも、応答が返る時点でホストには届いている。
 NET_REGISTRY_OK=1
 for host in ollama.com registry.ollama.ai registry.npmjs.org deb.nodesource.com; do
-  if curl -fsS --max-time 8 -o /dev/null "https://$host" 2>/dev/null; then
-    ok "$host  到達可"
+  # ★ `|| echo 000` を足してはいけない。curl は失敗時にも -w の書式を評価して
+  #   "000" を stdout に出すので、フォールバックが連結されて "000000" になり、
+  #   != "000" の判定をすり抜けて **到達不可を到達可と誤報する**（実際に踏んだ）。
+  #   終了コードは捨て、出力が空のときだけ 000 を補う。
+  code="$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' \
+          "https://$host" 2>/dev/null)" || true
+  [ -n "$code" ] || code=000
+  if [ "$code" != "000" ]; then
+    ok "$host  到達可 (HTTP $code)"
   else
-    warn "$host  到達不可（後段のインストールが失敗します）"
+    warn "$host  到達不可（egress ポリシーに塞がれている可能性）"
     [ "$host" = "registry.ollama.ai" ] && NET_REGISTRY_OK=0
   fi
 done
