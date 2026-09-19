@@ -69,10 +69,33 @@ colab_cli stop -s "$COLAB_SESSION" 2>&1 | sed 's/^/      /' \
   || warn "colab stop がエラーを返しました。下の一覧で実際に消えたか確認してください。"
 
 hdr "4. 確認"
+# ★ 1 回見て終わりにしてはいけない。停止した直後に、まだ走っている rsh や
+#   ProxyCommand が `colab ssh` を叩いてセッションを**作り直す**ことがある
+#   （colab ssh は無ければ黙って作る。RESULT.md の §6.4）。
+#   実際に踏んだ: T4 を止めた直後に CPU セッションが湧いていた。
+#   そこで、少し待ってからもう一度見て、湧いていたら止める。
 log "サーバ側の一覧:"
 colab_cli sessions 2>&1 | sed 's/^/      /'
+
 if session_exists; then
-  die "まだ残っています。手動で止めてください:
-         $(colab_cmd_str) stop -s $COLAB_SESSION"
+  warn "まだ残っています。もう一度止めます。"
+  colab_cli stop -s "$COLAB_SESSION" 2>&1 | sed 's/^/      /' || true
 fi
+
+log "再生成されていないか、5 秒おいて確かめます"
+sleep 5
+if session_exists; then
+  warn "セッションが再生成されました（停止中に ssh が走っていた可能性）。止めます。"
+  colab_cli stop -s "$COLAB_SESSION" 2>&1 | sed 's/^/      /' || true
+  sleep 3
+  if session_exists; then
+    die "止まりません。手動で確認してください:
+         $(colab_cmd_str) sessions
+         $(colab_cmd_str) stop -s $COLAB_SESSION
+     ★ -s にはセッション**名**を渡すこと。一覧に出る ID を渡すと not found になる。"
+  fi
+fi
+
+log "最終確認:"
+colab_cli sessions 2>&1 | sed 's/^/      /'
 ok "停止しました。課金は止まっています。"

@@ -134,7 +134,7 @@ MODEL_PROFILE=gpt-oss-20b bash remote/03_setup.sh
 | `qwen3-8b` | `qwen3:8b`（現行既定） | ◎ |
 | `qwen3-14b` | `qwen3:14b` | ◎ |
 | `gpt-oss-20b` | `gpt-oss:20b`（MXFP4 MoE） | ○ 余裕 +725MiB |
-| `gemma4-12b-qat` | `gemma4:12b-it-qat`（Gemma 4 12B QAT） | ◎ 実測 7681MiB / 100% GPU・実タスク5/5 |
+| `gemma4-12b-qat` | `gemma4:12b-it-qat`（Gemma 4 12B QAT, ctx=65536） | ◎ 実測 8375MiB / 100% GPU・実タスク5/5 |
 | `qwen25-coder-14b` | `qwen2.5-coder:14b`（不具合再現用） | ◎ |
 
 `scripts/vram_precheck.py` が **pull する前に**レジストリのマニフェストだけを見て
