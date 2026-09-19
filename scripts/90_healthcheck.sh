@@ -83,7 +83,11 @@ if have cline; then
   echo "    現在の設定（★ローカルの Ollama を向いているか目視確認）:"
   # `cline config`（引数なし）は CLI 3.x では対話専用になり TTY が無いと失敗するため、
   # 設定ファイルを直接読む。
-  PROVIDERS_JSON="${CLINE_DATA_DIR}/data/settings/providers.json"
+  # ★ 置き場所は CLI の版で変わる。common.sh の cline_providers_json() に
+  #   判定を集約してある（3.0.62 は data/ が付かない）。ここを旧パス決め打ちの
+  #   ままにしていたため、設定は正しく書けているのに「providers.json が無い」と
+  #   誤報していた（2026-09-18 実機で確認）。
+  PROVIDERS_JSON="$(cline_providers_json)"
   if [ -f "$PROVIDERS_JSON" ]; then
     python3 -c "
 import json

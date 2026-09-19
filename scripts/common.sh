@@ -15,6 +15,189 @@ export WORKSPACE="${WORKSPACE:-$WORKROOT/workspace}"
 export STATEDIR="${STATEDIR:-$WORKROOT/.cline-env}"
 
 # ---------------------------------------------------------------------------
+# アクセラレータの種別
+# ---------------------------------------------------------------------------
+# Colab の T4 は無料枠では取り合いで、確保できないことのほうが多い。
+# GPU が無いというだけで 1 行も先に進めないと、CPU でも潰せる検証
+# （ツール呼び出しが成立するか / Cline が何秒で切るか）まで T4 待ちになる。
+# そこで「GPU か CPU か」を 1 か所で決め、各スクリプトはこれを見て分岐する。
+#
+#   ACCEL=cpu bash scripts/60_cpu_verify.sh   # 明示的に CPU として扱う
+#
+# 未指定なら nvidia-smi の有無で決める。ここで `have` を使わないのは、
+# 定義がこのファイルのずっと下にあるため。
+export ACCEL="${ACCEL:-$(command -v nvidia-smi >/dev/null 2>&1 && echo gpu || echo cpu)}"
+case "$ACCEL" in
+  gpu|cpu) ;;
+  *)
+    printf '\033[31m[FATAL]\033[0m ACCEL=%s は未知です（gpu か cpu）。\n' "$ACCEL" >&2
+    exit 1
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# モデルプロファイル
+# ---------------------------------------------------------------------------
+# モデルを差し替えるたびに BASE_MODEL / NUM_CTX / CODEX_TOOL_REPAIR /
+# AGENTS.md の内容を個別に合わせるのは間違えやすい。組み合わせに名前を付けて
+# 1 変数で切り替えられるようにする。
+#
+#   MODEL_PROFILE=gpt-oss-20b bash scripts/00_setup_all.sh --with-codex
+#
+# 優先順位は「明示した環境変数 > プロファイル > 従来の既定値」。
+# MODEL_PROFILE を指定しなければ、従来とまったく同じ挙動になる。
+#
+# ここで die() を使わないのは、ログ関数の定義がこの下にあるため。
+export MODEL_PROFILE="${MODEL_PROFILE:-}"
+
+_p_base=""; _p_ctx=""; _p_repair=""; _p_rules=""; _p_note=""; _p_kv=""
+case "$MODEL_PROFILE" in
+  "")
+    # 未指定。従来の既定値をそのまま使う。
+    ;;
+  qwen3-8b)
+    # 36 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 2*36*8*128 = 73728 B/token
+    _p_base="qwen3:8b";  _p_ctx=32768; _p_repair=0; _p_rules=minimal; _p_kv=0.07
+    _p_note="現行既定。tool-calling 実績あり（手順書 §5.6 の V-2 実測）"
+    ;;
+  qwen3-14b)
+    # 40 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 81920 B/token
+    _p_base="qwen3:14b"; _p_ctx=16384; _p_repair=0; _p_rules=minimal; _p_kv=0.08
+    _p_note="8b と同系列。思考トークンが生成予算を食う点に注意（§5.4）"
+    ;;
+  gpt-oss-20b)
+    # MXFP4 量子化の MoE。ollama 公称 14GB ≈ 13.0 GiB で、T4 の空き
+    # （実測 14913 MiB ≈ 14.56 GiB）に対して余裕が 1GiB 程度しかない。
+    # num_ctx を 32768 にすると載らないので 16384 に落としてある。
+    # KV は 24 層 / KV ヘッド 8 / head_dim 64 と小さい。q8_0 で 24576 B/token。
+    # 汎用の既定値 0.08 を使うと過大評価になり、載るものを NG と判定してしまう。
+    # （実測はさらに小さく 0.013 MiB/token。0.024 は安全側の値として残してある）
+    #
+    # 2026-09-17 の実機実測（T4 / num_ctx=16384、RESULT.md 追記を参照）:
+    #   MXFP4 は sm_75 でも動く。offloaded 25/25 layers, 100% GPU
+    #   VRAM 12499 MiB 使用 / 2414 MiB 空き
+    #   prefill 880 tok/s, generation 34.5 tok/s（qwen3:8b の 23.6 より速い）
+    #   安全プロンプト長 13,645 tok（判定 OK）
+    # VRAM 的には num_ctx=32768 も載るが、速度側が先に頭打ちになる
+    # （安全プロンプト長が 13.6k なので 16384 で釣り合っている）。
+    #
+    # ★ 修復プロキシを 1 にしているのは、タグ無し JSON の修復（本来の用途）では
+    #   なく **ollama/ollama#17638 の再送** のため。gpt-oss は apply_patch のような
+    #   「単一のフリーフォーム文字列引数」を取るツールで出力が array-wrap になり、
+    #   Ollama 自身がパースに失敗して HTTP 500 を返すことがある（非決定的・
+    #   実測 0.34.1 で発生）。プロキシはこの 500 に限って投げ直す。
+    #   上流が直れば 0 に戻してよい。
+    _p_base="gpt-oss:20b"; _p_ctx=16384; _p_repair=1; _p_rules=minimal; _p_kv=0.024
+    _p_note="MXFP4 MoE。T4 で実機確認済み（100% GPU, 34.5 tok/s）。ollama#17638 対策で再送プロキシ経由"
+    ;;
+  gemma4-12b-qat)
+    # Gemma 4 12B QAT（2026-06-03 公開）。11.95B params / 48 層 / 256K ctx。
+    # Google が QAT (quantization-aware training) した q4_0 で、ollama 公称
+    # 約 7.2GB。T4 の空き（実測 14913 MiB ≒ 14.56 GiB）に対して余裕がある。
+    #
+    # ★ Gemma は一度却下している（docs/リモート化計画.md §0.3）。理由は
+    #   「Gemma 3 は Ollama のテンプレートに tool calling が入っていない」。
+    #   Gemma 4 では capabilities に tools が入ったので再評価する。
+    #
+    # ★★ 2026-09-18 実機検証: tool calling は **正しく動く**。
+    #   Colab CPU ランタイム / Ollama 0.34.2 / gemma4:12b-it-qat で、
+    #   /api/chat（think 既定）・/api/chat（think:false）・/v1/responses の
+    #   3 経路すべてが正しい tool_calls を返した。content への漏出はゼロ:
+    #       tool_calls: [write_file]
+    #       arguments : {"content":"hi","path":"hello.txt"}
+    #   下記 2 つの issue はいずれも **この版では再現しない**。
+    #   理由は Modelfile の `RENDERER gemma4` / `PARSER gemma4` にある。
+    #   Ollama 0.30.5+ は gemma4 を Jinja ではなくネイティブ実装で扱うため、
+    #   テンプレートが {{ .Prompt }}（素通し）に見えるが、これは正常。
+    #
+    #   そのため **_p_repair=0** にしてある。壊れていないモデルに修復プロキシを
+    #   噛ませても益は無く、ストリーミング表示を 1 チャンクに潰す副作用だけが残る
+    #   （qwen3 系・gpt-oss と同じ判断）。修復コード自体は残してある。上流の版が
+    #   変われば再発しうるし、scripts/34_toolcall_probe.sh で再確認できる。
+    #
+    #   ※ 副作用として、プロキシ経由だと Codex の stream_idle_timeout_ms が
+    #     効かなくなる（手順書 §7）。CPU で極端に遅く、生成中に切られる場合は
+    #     あえて _p_repair=1 に戻す、という使い方はありうる。
+    #
+    # 参考（この版では再現しなかった既知不具合）:
+    #     - ollama/ollama#15539 … system prompt + think:false + tools を
+    #       同時に送るとパーサが取りこぼし、content に
+    #       {"tool_calls":[{"function":N,"args":{}}]} + <channel|> が落ちる
+    #     - ollama/ollama#15798 … <|tool_call|> / <|"|> / <|channel|> 等の
+    #       テンプレート特殊トークンが本文にそのまま漏れる。
+    #       finish_reason は stop なのでクライアントは気付かない。
+    #       Closed as not planned（上流の修正見込み無し）
+    #   どちらも 12b-it-qat での報告ではなく（e4b / gemma4-64k）、
+    #   実機では再現しなかった（上記）。
+    #
+    # ★ KV の幾何（GGUF メタデータより。scripts/36_registry_probe.py）:
+    #     48 層 = SWA 40 + 大域 8（SWA×5 + 大域×1 の繰り返し）
+    #     KV ヘッド: SWA 層 8 / 大域層 1、key/value 長: 大域 512 / SWA 256
+    #     sliding window = 1024
+    #
+    #   ★ T4 実機のスイープ（2026-09-18）で KV の実寸が確定した。
+    #     VRAM 使用量（49/49 層すべて GPU、q8_0）:
+    #       ctx= 32,768 ->  8,025 MiB
+    #       ctx= 65,536 ->  8,375 MiB
+    #       ctx=131,072 ->  8,891 MiB
+    #       ctx=196,608 ->  9,627 MiB
+    #       ctx=262,144 -> 10,363 MiB（空き 4,550 MiB）
+    #     傾きは **0.0102 MiB/token**。Ollama は SWA の KV を window で
+    #     頭打ちにしていることになる。当初の安全側 0.164 は 16 倍の過大評価で、
+    #     事前チェックが 12,834 MiB 必要と出したのに実際は 7,681 MiB だった。
+    #     余裕を見て 0.03（実測の約 3 倍）にしてある。
+    #
+    # ★★ num_ctx=65536 の根拠 — 律速は VRAM ではなくリクエストの制限時間。
+    #
+    #   VRAM だけ見れば設計上限の 262,144 まで載る。262,144 の構成で
+    #   134,916 トークンの実プロンプトも通した（450 秒、OOM 無し、49/49 層 GPU）。
+    #
+    #   しかし prefill 速度が長さとともに落ちる:
+    #       13,181 tok -> 666 tok/s
+    #      134,916 tok -> 308 tok/s   ← 半分以下
+    #
+    #   Cline の 1 リクエスト予算 300 秒（§7）から出力 500 tok 分の 31 秒を
+    #   引くと prefill に使えるのは 269 秒。各 ctx を満たすのに要する時間は:
+    #       ctx= 32,768 ->   62s  収まる
+    #       ctx= 65,536 ->  156s  収まる
+    #       ctx=131,072 ->  419s  ★予算超過
+    #       ctx=262,144 -> 1274s  ★予算超過
+    #
+    #   つまり **65,536 が「実際に使い切れる」上限**。これ以上は VRAM を
+    #   余計に食うだけで、文脈を埋めきる前にリクエストが切れる。
+    #   もっと長い文脈が要るなら VRAM 的には 262,144 まで上げられるが、
+    #   その場合は CLINE_REQUEST_BUDGET_SEC も一緒に伸ばすこと。
+
+    _p_base="gemma4:12b-it-qat"; _p_ctx=65536; _p_repair=0; _p_rules=minimal; _p_kv=0.03
+    _p_note="Gemma 4 12B QAT。tool calling は実機で正常確認済み（Ollama 0.34.2 のネイティブ PARSER）。修復プロキシ不要"
+    ;;
+  qwen25-coder-14b)
+    # 評価対象からは外したが、§5.8 / §5.8.1 の再現用に定義だけ残す。
+    # このモデルだけは修復プロキシと apply_patch 回避ルールが要る。
+    # 48 層 / KV ヘッド 8 / head_dim 128 -> q8_0 で 98304 B/token
+    _p_base="qwen2.5-coder:14b-instruct-q4_K_M"; _p_ctx=16384; _p_kv=0.094
+    _p_repair=1; _p_rules=apply-patch-workaround
+    _p_note="不具合の再現用（§5.8/§5.8.1）。評価対象からは外している"
+    ;;
+  *)
+    printf '\033[31m[FATAL]\033[0m MODEL_PROFILE=%s は未知です。\n' "$MODEL_PROFILE" >&2
+    printf '        使えるもの: qwen3-8b / qwen3-14b / gpt-oss-20b / gemma4-12b-qat / qwen25-coder-14b\n' >&2
+    printf '        （未指定なら従来の既定値で動きます）\n' >&2
+    exit 1
+    ;;
+esac
+
+# AGENTS.md に書く運用ルールの種類。
+#   minimal                 … 「1ファイルずつ」「書いたら確認」程度
+#   apply-patch-workaround  … qwen2.5-coder 用。apply_patch を禁じ heredoc を強制
+export AGENTS_RULESET="${AGENTS_RULESET:-${_p_rules:-minimal}}"
+
+# KV キャッシュの 1 トークンあたりのサイズ（MiB, q8_0 想定）。
+# 20_ollama.sh の pull 前 VRAM チェックが使う。モデルの層数 / KV ヘッド数 /
+# head_dim で決まるのでモデルごとに違う。既定は安全側に倒した汎用値。
+export KV_MIB_PER_TOKEN="${KV_MIB_PER_TOKEN:-${_p_kv:-0.08}}"
+
+# ---------------------------------------------------------------------------
 # Ollama
 # ---------------------------------------------------------------------------
 # 127.0.0.1 のみ。外部公開はしない（する必要が無い構成になった）。
@@ -22,10 +205,22 @@ export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 
 # T4 (sm_75) は bf16 非対応。GGUF 量子化で回避する。
-export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
-export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
-# ★重要: Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
-#   モデルのロード時間がその 30 秒に食い込むと確実に落ちるので、絶対にアンロードさせない。
+#
+# ★ この 2 つは GPU 前提の設定なので、CPU では既定を変える。
+#   Ollama の KV キャッシュ量子化（q8_0）は FlashAttention が有効なときにしか
+#   効かず、CPU バックエンドでは FlashAttention が使えない。GPU 用の値を
+#   そのまま渡すと、効かないか警告で埋まるだけで得が無い。
+if [ "$ACCEL" = "cpu" ]; then
+  export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
+  export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-f16}"
+else
+  export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+  export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+fi
+# ★重要: モデルのロード時間がリクエストの制限時間に食い込むと落ちるので、
+#   絶対にアンロードさせない。（かつては Cline の 30 秒制限が理由だったが、
+#   3.0.62 では 300 秒になった。手順書 §7 の訂正。それでも 7GB のロードを
+#   毎回挟む理由は無いので、この設定は据え置く。）
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
@@ -36,13 +231,22 @@ export OLLAMA_MODELS="${OLLAMA_MODELS:-/root/.ollama/models}"
 # （生の JSON をそのままテキストで返す）。Cline はそれをツール呼び出しとして解釈できず、
 # チャットで説明するだけで一切ファイルを書かない。qwen3:8b は同一条件で <tool_call> を
 # 正しく守り、実タスクが完走することを実機で確認済み（V-2 実測、2026-09-03）。
-export BASE_MODEL="${BASE_MODEL:-qwen3:8b}"
+export BASE_MODEL="${BASE_MODEL:-${_p_base:-qwen3:8b}}"
 export CLINE_MODEL="${CLINE_MODEL:-cline-coder}"
-export NUM_CTX="${NUM_CTX:-32768}"
+export NUM_CTX="${NUM_CTX:-${_p_ctx:-32768}}"
 export NUM_PREDICT="${NUM_PREDICT:-8192}"
 
-# Cline CLI が 1 リクエストに使える秒数（実測値の評価基準に使う）
-export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-30}"
+# Cline CLI が 1 リクエストに使える秒数（ベンチの判定基準に使う）
+#
+# ★ 2026-09-18 に 30 -> 300 へ変更した。手順書 §7 の訂正のとおり、
+#   Cline CLI 3.0.62 の OLLAMA_DEFAULT_TIMEOUT_MS は 300000（300 秒）で、
+#   30 秒で切られるという前提はもう成り立たない（実測済み）。
+#
+#   30 のままだと判定が実態と矛盾する。実際 T4 + gemma4:12b-it-qat で
+#   「判定 NG / この構成では実用になりません」と出したその同じ実行で、
+#   codex exec の実タスクは 5/5 完走している（1 回 37〜92 秒）。
+#   生成 500 トークンが 35.9 秒かかる、というだけの理由で NG になっていた。
+export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-300}"
 
 # ---------------------------------------------------------------------------
 # Codex CLI 用ツール呼び出し修復プロキシ（手順書 §5.8）
@@ -52,7 +256,11 @@ export CLINE_REQUEST_BUDGET_SEC="${CLINE_REQUEST_BUDGET_SEC:-30}"
 # openai/codex#2229）。CODEX_TOOL_REPAIR=1（既定）のとき、31_alt_agents.sh は
 # scripts/32_codex_tool_proxy.py を Codex と Ollama の間に起動し、Codex の
 # config.toml をこのプロキシへ向ける。0 にすると旧来どおり Ollama に直結する。
-export CODEX_TOOL_REPAIR="${CODEX_TOOL_REPAIR:-1}"
+#
+# 既定値はプロファイル依存。壊れていないモデル（qwen3 系・gpt-oss）に噛ませても
+# 益は無く、ストリーミング表示を 1 チャンクに潰す副作用だけが残るため 0 にする。
+# プロファイル未指定のときは従来どおり 1（qwen2.5-coder を想定した既定）。
+export CODEX_TOOL_REPAIR="${CODEX_TOOL_REPAIR:-${_p_repair:-1}}"
 export CODEX_PROXY_PORT="${CODEX_PROXY_PORT:-11435}"
 export CODEX_PROXY_BASE_URL="${CODEX_PROXY_BASE_URL:-http://127.0.0.1:$CODEX_PROXY_PORT}"
 
@@ -94,9 +302,69 @@ trap 'if [[ $- == *e* ]]; then die "line $LINENO で失敗しました (exit=$?)
 # ---------------------------------------------------------------------------
 # ユーティリティ
 # ---------------------------------------------------------------------------
+# 選択中のモデル構成を 1 行で示す。どのモデルで測った数字なのかを
+# ログに必ず残すため、主要スクリプトの冒頭で呼ぶ。
+model_profile_banner() {
+  if [ -n "$MODEL_PROFILE" ]; then
+    log "MODEL_PROFILE=$MODEL_PROFILE"
+    [ -n "${_p_note:-}" ] && printf '       %s\n' "$_p_note"
+  else
+    log "MODEL_PROFILE 未指定（従来の既定値で動きます）"
+  fi
+  printf '       BASE_MODEL=%s  NUM_CTX=%s  CODEX_TOOL_REPAIR=%s  AGENTS_RULESET=%s\n' \
+         "$BASE_MODEL" "$NUM_CTX" "$CODEX_TOOL_REPAIR" "$AGENTS_RULESET"
+}
+
 ensure_dirs() { mkdir -p "$LOGDIR" "$WORKSPACE" "$STATEDIR"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- アクセラレータごとのメモリ問い合わせ ----------------------------------
+# GPU なら VRAM、CPU ならシステム RAM を見る。20_ollama.sh / 10_preflight.sh の
+# 両方が同じ判断を必要とするので、分岐をここ 1 か所に閉じ込める。
+
+# accel_mem_label — 出力やログに出す名前（"VRAM" / "RAM"）
+accel_mem_label() { [ "$ACCEL" = "cpu" ] && echo RAM || echo VRAM; }
+
+# accel_free_mib — 今すぐモデルに使える空きメモリを MiB で返す
+#
+# CPU 側で free の "free" ではなく "available" を使うのは、ページキャッシュに
+# 使われている分は回収できるため。"free" を見ると実際より少なく出て、
+# 載るモデルまで NG と判定してしまう。
+accel_free_mib() {
+  if [ "$ACCEL" = "cpu" ]; then
+    awk '/^MemAvailable:/ {printf "%d\n", $2 / 1024}' /proc/meminfo
+  else
+    nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1
+  fi
+}
+
+# cline_providers_json — Cline CLI のプロバイダ設定ファイルの実際の場所を返す
+#
+# ★ 置き場所は CLI の版で変わる。実機で確認した実績:
+#     3.0.62 : $CLINE_DATA_DIR/settings/providers.json
+#     それ以前: $CLINE_DATA_DIR/data/settings/providers.json
+#   古いほうを決め打ちしていたため、3.0.62 では設定が正しく書けているのに
+#   「providers.json がありません。cline auth が失敗した可能性があります」と
+#   誤警告していた（2026-09-18 実測）。
+#   存在するほうを返し、どちらも無ければ現行版の場所を返す（作成先として使える）。
+cline_providers_json() {
+  local new="$CLINE_DATA_DIR/settings/providers.json"
+  local old="$CLINE_DATA_DIR/data/settings/providers.json"
+  if [ -f "$new" ]; then printf '%s\n' "$new"
+  elif [ -f "$old" ]; then printf '%s\n' "$old"
+  else printf '%s\n' "$new"
+  fi
+}
+
+# accel_mem_report — 現在のメモリ状況を数行で出す（末尾の実測用）
+accel_mem_report() {
+  if [ "$ACCEL" = "cpu" ]; then
+    free -m | awk '/^Mem:/ {printf "total %s MiB, used %s MiB, available %s MiB\n", $2, $3, $7}'
+  else
+    nvidia-smi --query-gpu=memory.total,memory.used,memory.free --format=csv,noheader
+  fi
+}
 
 # first_line <コマンド...> — 版数などを 1 行だけ安全に取り出す。
 #

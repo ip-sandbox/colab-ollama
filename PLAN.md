@@ -1,81 +1,215 @@
-# 作業計画: Codex CLI × Ollama qwen2.5-coder:14b ツール呼び出し修正
+# 作業計画（改訂 2026-09-18）: 残りの検証をどこで潰すか
 
-## 背景・目的
+ブランチ: `feature/colab-cli-remote-control`
 
-`qwen2.5-coder:14b-instruct-q4_K_M` を Ollama 上で構築し、Codex CLI から使えるようにする。
+## Context — なぜ再計画するか
 
-Codex CLI + Ollama の組み合わせでは、モデルがツール呼び出し用の JSON を組み立てても、
-Ollama がそれを OpenAI 互換の `tool_calls` 構造として返さず、プレーンテキストの
-`content` に生の JSON を吐いてしまう不一致が知られている。
+前の計画は「重みを取得できる環境が無い」前提で書いていた。状況が 2 つ変わった。
 
-参考:
-- https://blog.mocobeta.dev/posts/20260406-qwen3-coder-codex/
-- https://note.com/zephel01/n/nd7ea543ab654
-- https://github.com/openai/codex/issues/2229
+1. **この操作用マシンは `colab` に到達できる**（`remote/00_doctor.sh` が全項目 OK、
+   稼働中セッション無し）。つまり Colab の CPU ランタイムと T4 の両方を作れる。
+2. **レジストリのマニフェストとブロブ先頭に到達できる。** ここから
+   **モデルを pull せずに** 相当のことが確定した（下記 L0）。
 
-この不一致は本リポジトリ自身がすでに実機検証済みの現象と同根である
-(`docs/手順書.md` §5.6: `qwen2.5-coder:7b-instruct-q4_K_M` は Ollama のテンプレートが
-要求する `<tool_call>{...}</tool_call>` ラッパーを付けずに生 JSON を返す →
-Ollama サーバのパーサーが `message.tool_calls` を埋められず `message.content` に
-丸ごと落ちる → エージェント側はテキストとして解釈しツールを実行しない)。
-GitHub issue #2229 のコメント（BigMitchGit 氏）も同じ原因説明をしている。
+その結果、**前の計画で「実機待ち」にしていた項目の半分が、VM を 1 台も作らずに片付いた。**
+同時に、**出荷済みコードの欠陥が 1 件見つかった**（§1）。残りを整理し直す。
 
-14b 量子化版でも同様に壊れる可能性が高い（issue #2229 はまさに 14b での報告）。
-今回は単に「使えないモデル」として退けるのではなく、参考記事が示す
-**修復プロキシ方式**を実装し、qwen2.5-coder:14b を実際に Codex CLI から
-使える状態にする。
+---
 
-## 方針
+## L0（新設）: レジストリだけで分かること — VM 不要・課金ゼロ
 
-### 1. 原因の実機再現
-プロキシ無しで直結し、
-- curl で `/v1/chat/completions` に `tools` 付きリクエストを直接送り、
-  `message.content` に生 JSON が落ちることを確認
-- `codex exec` 経由の実タスクでファイルが作られないことを確認
+Ollama のマニフェストは数 KB、GGUF のメタデータはブロブ**先頭**にある。
+`Range` 付きで先頭 96 MiB だけ取れば、6.5 GiB を落とさずにテンプレートと
+アーキテクチャが読める。実際に読んだ。
 
-### 2. 修復プロキシ (`scripts/32_codex_tool_proxy.py`)
-Python 標準ライブラリのみで実装する、Codex CLI と Ollama の間に立つ透過プロキシ。
+### 1. ★ 出荷済みの Gemma 4 修復は、実際の出力形式に合っていない
 
-- `127.0.0.1:$CODEX_PROXY_PORT`（既定 11435）で待受
-- `POST /v1/chat/completions`:
-  - リクエストの `tools[].function.name` から有効なツール名集合を作る
-  - 上流 Ollama へは常に `stream:false` で転送
-  - レスポンスの `message.content` が `<tool_call>` タグ / ```` ```json ```` フェンス /
-    素の JSON のいずれかで `{"name": <有効なツール名>, "arguments": {...}}` 形状を
-    含む場合、正しい `message.tool_calls` に組み替える（誤爆防止のため、ツール名が
-    有効集合に無ければ無変更で通す）
-  - クライアントが `stream:true` を要求していた場合は、修復後の内容を
-    OpenAI 互換 SSE 1チャンク + `[DONE]` として返す
-- 判定結果（repaired / passthrough）をログに残す
+`scripts/32_codex_tool_proxy.py` に入れた `<|tool_call|>` 系の処理は
+**ollama#15798 の文章から起こしたもの**で、逐語サンプルが無いことを
+コメントと手順書に明記していた。テンプレート実物と突き合わせた結果、**外れていた。**
 
-### 3. 配線変更
-- `scripts/common.sh` に `CODEX_PROXY_PORT` / `CODEX_PROXY_BASE_URL` /
-  `CODEX_TOOL_REPAIR`（既定 1=有効、0で旧来の直結に戻せる）を追加
-- `scripts/31_alt_agents.sh` の Codex ブロックでプロキシを起動し、
-  `config.toml` の `base_url` をプロキシに向け、`wire_api="chat"` に固定
-- `scripts/99_teardown.sh` / `scripts/90_healthcheck.sh` にプロキシの停止・監視を追加
+モデルのチャットテンプレート（GGUF の `tokenizer.chat_template`、17,466 文字）が
+tool call を吐く箇所は、ここが全て:
 
-### 4. ドキュメント
-- `docs/手順書.md` に新節を追加（14b + Codex の再現結果、原因、解決方法、実測結果）
-- `README.md` に一行追記
-
-### 5. 実機構築・検証（この Colab T4 サンドボックス上）
-
-```
-BASE_MODEL=qwen2.5-coder:14b-instruct-q4_K_M NUM_CTX=16384 \
-  bash scripts/00_setup_all.sh --with-codex
+```jinja
+{{- '<|tool_call>call:' + function['name'] + '{' -}}
+    {%- for key, value in function['arguments'] | dictsort -%}
+        {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
+    {%- endfor -%}
+{{- '}<tool_call|>' -}}
 ```
 
-1. `CODEX_TOOL_REPAIR=0` で直結し、壊れることを再現
-2. `CODEX_TOOL_REPAIR=1` でプロキシ経由にし、修復されて実タスクが完走することを確認
-3. 結果を `RESULT.md` に記録
+`format_argument` は文字列を `<|"|>` で囲む。したがって実際の出力は:
 
-## 手順（ステップごとに commit + push）
+```
+<|tool_call>call:write_file{content:<|"|>hi<|"|>,path:<|"|>hello.txt<|"|>}<tool_call|>
+```
 
-1. ブランチ作成: `feature/qwen25-coder-14b-codex-tool-proxy`
-2. 本 `PLAN.md` を commit + push
-3. コード変更一式を実装し、commit + push（実機検証の前に永続化）
-4. 実機構築・壊れ確認（プロキシ無効）
-5. プロキシ有効化・修復確認
-6. `RESULT.md` を書き、commit + push
-7. GitHub 上で PR を作成
+**実装が外している点が 3 つある:**
+
+| # | 実装の想定 | 実際 |
+|---|---|---|
+| 1 | `<\|tool_call\|>`（左右対称） | `<\|tool_call>` … `<tool_call\|>` （**非対称**） |
+| 2 | `call:` は行頭に単独で出る | `<\|tool_call>call:` と地続き |
+| 3 | `<\|"\|>` を `"` に replace すれば JSON になる | **キーが裸**（`content:`）なので JSON にならない |
+
+3 が本質的で、正規表現の置換では済まない。**専用のパーサが要る。**
+（`<\|"\|>` を `"` に直す処理だけは正しかった。テンプレートに 22 回出現する。）
+
+トークンの実物は次の 6 対（すべて非対称）:
+
+```
+<|tool_call>   … <tool_call|>      <|tool_response> … <tool_response|>
+<|channel>     … <channel|>        <|turn>          … <turn|>
+<|tool>        … <tool|>           <|"|>（これだけ対称。文字列の引用）
+```
+
+**作業**: `_gemma_normalize()` を捨て、`<|tool_call>call:NAME{...}<tool_call|>` を
+直接パースする関数に置き換える。キーは裸・値は `<|"|>` 文字列 / `true` / `false` /
+数値 / `{...}` / `[...]` の再帰。`dictsort` 済みなのでキー順は辞書順。
+`test_tool_proxy_gemma4.py` の #15798 系ケースを実テンプレート由来の文字列に差し替える。
+
+> **これは「テンプレートがそう書けている」という根拠であって、実機の出力そのものでは
+> ない。** モデルはこの形式で訓練されているので同じ形を吐く公算が高いが、確認は L2。
+
+### 2. KV の実寸が確定した（暫定値 0.05 は両方向に外れていた）
+
+| 項目 | 値 |
+|---|---|
+| 層数 | 48（SWA 40 / 大域 8。パターンは SWA×5 + 大域×1 の繰り返し） |
+| KV ヘッド | SWA 層 8 / **大域層 1** |
+| key/value 長 | 大域 512/512 / SWA 256/256 |
+| sliding window | 1024 |
+
+**Ollama が SWA の KV を window で頭打ちにするなら:**
+
+| 量子化 | ctx 比例分 | SWA 固定分 | ctx=32768 の KV |
+|---|---:|---:|---:|
+| f16 | 0.0156 MiB/tok | 320 MiB | 832 MiB |
+| q8_0 | 0.0078 MiB/tok | 160 MiB | 416 MiB |
+
+**頭打ちにせず全層に ctx 分を確保するなら:**
+
+| 量子化 | ctx 比例分 | ctx=32768 の KV |
+|---|---:|---:|
+| f16 | 0.328 MiB/tok | 10,752 MiB |
+| q8_0 | 0.164 MiB/tok | 5,376 MiB |
+
+**どちらなのかで num_ctx の上限が一桁変わる。** これが L2 で測るべき最重要の数字。
+それまでは**安全側（頭打ち無し・q8_0 = 0.164）**を `KV_MIB_PER_TOKEN` に置く。
+現行の 0.05 は頭打ち無しの場合に **3 倍以上楽観**で、危ない方向に外れている。
+
+### 3. `vram_precheck.py` が projector 層を数えていない
+
+gemma4 のマニフェストには `image.model`（6653 MiB）のほかに
+**`image.projector`（167 MiB）**がある。マルチモーダルの投影層で、これも載る。
+`MODEL_LAYER_SUFFIX = "image.model"` しか合計していないので **167 MiB 過小**。
+gemma4 では誤差だが、投影層の大きいモデルでは効く。
+
+**作業**: `image.projector` も合計に含め、内訳を別行で出す。
+
+### 4. L0 をスクリプトにする
+
+ここでやったことは手作業だったが、**新しいモデルを評価対象に入れるたびに毎回やる価値がある**
+（テンプレートが tool calling をどう吐くか・KV の実寸・projector の有無が、
+pull 前に、課金ゼロで分かる）。`scripts/36_registry_probe.py` として切り出す。
+
+- マニフェストから層構成（model / projector / params / template の有無とサイズ）
+- ブロブ先頭を `Range` 取得して GGUF メタデータを解析
+- `tokenizer.chat_template` を保存し、tool 関連トークンを列挙
+- 層数 / KV ヘッド / key・value 長 / sliding window から KV/token を算出
+- 結果を `$STATEDIR/registry-probe/` に保存
+
+これは `34_toolcall_probe.sh`（実挙動）の**前段**にあたる。
+「テンプレートはどう書けているか」→「実際に何を吐くか」の順に潰す。
+
+---
+
+## L1: モデル不要（VM 不要・課金ゼロ）— 残り 1 件
+
+Cline のタイムアウトは実測済み（300 秒。手順書 §7 の訂正）。**Codex 側が未測定。**
+
+`scripts/test_slow_upstream_stub.py` は Ollama ネイティブと OpenAI 互換しか喋らないので、
+**`/v1/responses` を足す**（Codex CLI 0.15x はこれしか喋らない）。そのうえで:
+
+- `~/.codex/config.toml` の `stream_idle_timeout_ms`（既定 600 秒）が本当に効くか
+- 効かない場合の実際の打ち切り秒数
+- 修復プロキシを挟んだとき、プロキシが `stream:false` に落とすことで
+  idle timeout の意味が変わらないか（プロキシは上流完了まで何も返さない）
+
+最後の項目は実運用に直結する。**プロキシ経由だと「無通信時間 = 上流の応答時間まるごと」**に
+なるので、CPU で遅いときに idle timeout を踏みやすい。
+
+---
+
+## L2: Colab CPU ランタイム（GPU 枠を消費しない）
+
+```bash
+bash remote/00_all.sh --gpu cpu --profile gemma4-12b-qat
+```
+
+**ここでしか確定できないこと:**
+
+1. **Ollama が SWA の KV を頭打ちにするか**（L0 §2 の二択）。
+   `num_ctx` を 8192 と 32768 で作り、`/api/ps` と実メモリの差を見る。
+   比例していれば頭打ち無し、ほぼ変わらなければ頭打ちあり。
+2. **`tool_calls` に入るか、`content` に漏れるか。** 漏れるなら生の文字列。
+   `bash scripts/34_toolcall_probe.sh` の行列（system prompt 有無 × think 有無 ×
+   エンドポイント 3 種）。ollama#15539 の発火条件がこの組み合わせ。
+3. L0 §1 で書き直したパーサが、実際の漏れ方に噛み合うか。
+
+**制約と段取り:**
+
+- 無料 CPU ランタイムは RAM 約 12.7GB。重み 6.5GiB + projector 167MiB なので
+  **`NUM_CTX=8192` で始める**（プロファイルの 32768 は T4 向け。CPU では KV が
+  頭打ち無しだと 32768 で 1.3GiB〜5GiB 食う）
+- **生成が致命的に遅い。** 2 vCPU で 12B は 1〜2 tok/s。しかも gemma4 は
+  thinking モデルなので、1 応答に思考トークンが数百〜数千乗る。
+  **プローブに `num_predict` の上限を足す**（現状は無制限。1 セルで 30 分超えうる）
+- 所要見積り: ollama 導入 2分 + pull 6.5GB 5〜10分 + プローブ 7 セル 20〜60分
+- **`--stop` を付けるか、終わったら必ず `bash remote/09_stop.sh`。**
+  止め忘れると 24 時間キープアライブが回り続ける（手順書 §12.6）
+
+## L3: T4（GPU 枠と課金を使う。L2 の後）
+
+```bash
+bash remote/00_all.sh --gpu T4 --retry 3 --profile gemma4-12b-qat --eval 5 --stop
+```
+
+- prefill / generation の実測と安全プロンプト長（§5.4 の形式で）
+- **`num_ctx` の実上限。** L0 §2 の二択が決まっていれば計算で当たりを付けられる。
+  頭打ちありなら 131072 すら載る計算（KV 1184 MiB @q8_0）。無しなら 32768 が上限付近
+- 実タスク 5 回の完走率。修復プロキシの発火回数も記録（§12.7 と同じ形式）
+- thinking がどれだけ予算を食うか（`20_ollama.sh` のベンチが `<think>` を検出する）
+
+---
+
+## 順番と、その理由
+
+| | 内容 | VM | 課金 | 依存 |
+|---|---|:--:|:--:|---|
+| **1** | L0 §1 パーサ書き直し + テスト差し替え | 不要 | ゼロ | — |
+| **2** | L0 §2/§3 `KV_MIB_PER_TOKEN` を安全側へ / projector 加算 | 不要 | ゼロ | — |
+| **3** | L0 §4 `36_registry_probe.py` に切り出す | 不要 | ゼロ | 1,2 |
+| **4** | L1 スタブに `/v1/responses` + Codex タイムアウト実測 | 不要 | ゼロ | — |
+| **5** | L2 CPU ランタイムで実挙動 | CPU | 少 | 1〜3 |
+| **6** | 1 を L2 の実データで再検証・必要なら修正 | 不要 | ゼロ | 5 |
+| **7** | L3 T4 で速度と完走率 | T4 | 中 | 5,6 |
+
+1〜4 は**今すぐ、VM を作らずに**できる。5 以降は Colab の計算ユニットを使うので、
+着手前に確認する。
+
+**5 を 7 より先にやる理由**: 最大の未知数（tool_calls が返るか）は CPU でも確定でき、
+その答え次第で 7 の設計が変わる。漏れるなら修復プロキシ有りで測らないと意味が無いし、
+そもそも修復が噛み合わなければ T4 を取っても完走率は測れない。
+**T4 は取り合いなので、確保できた時間を「CPU では測れないこと」だけに使う。**
+
+## リスク
+
+| リスク | 対処 |
+|---|---|
+| テンプレートは入力の描画方法であって、出力の保証ではない | L2 で実出力を採る。L0 §1 はあくまで「根拠のある推定」 |
+| CPU で thinking が長すぎてプローブが終わらない | `num_predict` 上限を足す。それでも駄目なら think:false 側の結果だけ採る |
+| CPU ランタイムの RAM 12.7GB に載らない | `NUM_CTX=8192`。事前チェックが RAM 基準で止める |
+| VM の停止忘れ | `--stop` を既定にする。`_finish` トラップが停止を促す |
+| Ollama の版で挙動が変わる | プローブが `ollama --version` を記録する |

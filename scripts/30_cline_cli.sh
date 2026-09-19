@@ -116,7 +116,7 @@ EOT
 # `cline config`（引数なし）は CLI 3.x では対話モード専用になり、
 # TTY が無いここでは "interactive mode requires a TTY" で必ず失敗する。
 # 設定ファイルを直接見て確認する。
-PROVIDERS_JSON="${CLINE_DATA_DIR}/data/settings/providers.json"
+PROVIDERS_JSON="$(cline_providers_json)"
 if [ -f "$PROVIDERS_JSON" ]; then
   log "lastUsedProvider と設定内容 ($PROVIDERS_JSON):"
   python3 -c "

@@ -48,12 +48,31 @@ fi
 # --- 実行 ----------------------------------------------------------------
 # `--yolo` は CLI 3.x に無い（`cline --help` に存在しない）。
 # 全ツール自動承認は `--auto-approve <boolean>` で指定する（既定は true）。
-ARGS=(--cwd "$WORKSPACE" --timeout "$TASK_TIMEOUT")
+# ★★ -P / -m を必ず渡すこと。**これが無いとクラウドに投げる。**
+#
+#   cline --help より:  -P, --provider <id>   Provider id (default: cline)
+#
+#   `cline auth -p ollama ...` は providers.json に設定を書き、
+#   lastUsedProvider も ollama にする。しかし **セッションの既定プロバイダは
+#   それとは無関係に `cline`（クラウド）** で、実行時に -P を渡さない限り
+#   ローカルの Ollama は使われない。
+#
+#   症状は分かりにくい。モデルにもポートにも問題が無いのに
+#       error: Unauthorized: Please make sure you're using the latest version
+#              of Cline and re-authenticate your Cline account.
+#   が出て即座に終わる（実測 3〜7 秒）。手順書 §6.1 が言う「既定はクラウド」は
+#   providers.json を見るだけでは防げない、ということ。
+#   2026-09-18 に T4 実機で確認: -P/-m を足したら同じ条件で 64 秒で完走した。
+CLINE_PROVIDER_ID="${CLINE_PROVIDER_ID:-ollama}"
+[ "$CLINE_PROVIDER" = "openai-compatible" ] && CLINE_PROVIDER_ID="openai-compatible"
+ARGS=(--cwd "$WORKSPACE" --timeout "$TASK_TIMEOUT"
+      -P "$CLINE_PROVIDER_ID" -m "$CLINE_MODEL")
 [ "$AUTO_APPROVE" = "1" ] && ARGS+=(--auto-approve true) || ARGS+=(--auto-approve false)
 
 hdr "Cline 実行"
 printf '    cwd     : %s\n' "$WORKSPACE"
 printf '    model   : %s (num_ctx=%s)\n' "$CLINE_MODEL" "$NUM_CTX"
+printf '    provider: %s（-P で明示。無いとクラウドに行く）\n' "$CLINE_PROVIDER_ID"
 printf '    timeout : %ss\n' "$TASK_TIMEOUT"
 [ "$AUTO_APPROVE" = "1" ] && printf '    approve : --auto-approve true（承認スキップ）\n' \
                           || printf '    approve : --auto-approve false（対話承認。TTY が無いと固まるので注意）\n'

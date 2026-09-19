@@ -47,17 +47,100 @@ else
     || die "起動しませんでした。ログ: $OLLAMA_LOG"
 fi
 
-hdr "3. ベースモデルの取得"
+MEM_LABEL="$(accel_mem_label)"
+hdr "3. $MEM_LABEL 事前チェック（pull の前に判定する）"
+# ★ ここが無いと、15GB のモデルを落としきってから「載りません」と分かる。
+#   判定はレジストリのマニフェスト（数 KB）だけで行うので pull は不要。
+#   詳細は scripts/vram_precheck.py の docstring。
+# ★ 測る前に、ロード済みのモデルを必ず降ろす。
+#   OLLAMA_KEEP_ALIVE=-1 にしているため、前のモデルは放っておくと VRAM に
+#   居座り続ける。その状態で「空き VRAM」を測ると、載るはずのモデルまで
+#   NG と判定してしまう（実機で踏んだ: qwen3:8b が 7.7GB 占有していて
+#   空きが 7412 MiB しかなく、gpt-oss:20b が -6776 MiB と誤判定された）。
+#   どのみちこの後で新しいモデルをロードするので、ここで降ろすのが正しい。
+LOADED="$(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')"
+if [ -n "$LOADED" ]; then
+  log "先にロード済みモデルを降ろします: $(printf '%s' "$LOADED" | tr '\n' ' ')"
+  printf '%s\n' "$LOADED" | while read -r m; do
+    [ -n "$m" ] && ollama stop "$m" >/dev/null 2>&1 || true
+  done
+  sleep 3
+fi
+
+MEM_FREE_MIB="$(accel_free_mib)"
+log "空き $MEM_LABEL: ${MEM_FREE_MIB} MiB"
+
+# KV キャッシュの 1 トークンあたりのサイズ（MiB, q8_0 想定）。
+# 層数 / KV ヘッド数 / head_dim で決まるのでモデルごとに違う。
+# 既定は 8〜24B 級の安全側の値。プロファイル側から上書きできる。
+KV_MIB_PER_TOKEN="${KV_MIB_PER_TOKEN:-0.08}"
+# 計算バッファ（活性値・グラフ）。実測でおおむね 0.5〜0.7 GiB。
+COMPUTE_BUF_MIB="${COMPUTE_BUF_MIB:-640}"
+
+# ★ 出力先とキーは変えないこと。手順 4 の pull 前の警告がこの JSON の
+#   weights_mib を読んで「重みは約 N GB」と出している（e82d035）。
+#   CPU モードでも同じパス・同じキーで書き出す。ラベルだけが変わる。
+#
+# set -e 下でも終了コードを自前で見たいので || true で受ける
+set +e
+python3 "$(cd "$(dirname "$0")" && pwd)/vram_precheck.py" \
+        "$BASE_MODEL" "$MEM_FREE_MIB" "$NUM_CTX" \
+        "$KV_MIB_PER_TOKEN" "$COMPUTE_BUF_MIB" "$STATEDIR/vram-precheck.json" \
+        "$MEM_LABEL"
+PRECHECK_RC=$?
+set -e
+
+case "$PRECHECK_RC" in
+  0) ok "$MEM_LABEL は足ります" ;;
+  1)
+    if [ "${FORCE_VRAM:-0}" = "1" ]; then
+      if [ "$ACCEL" = "cpu" ]; then
+        warn "RAM が足りませんが FORCE_VRAM=1 なので続行します。
+       スワップが無い環境では OOM Killer に殺されます。"
+      else
+        warn "VRAM が足りませんが FORCE_VRAM=1 なので続行します。
+       層の一部が CPU にあふれ、推論が一桁遅くなります。ベンチの数字は
+       この構成の実力ではなく「あふれた状態の数字」になります。"
+      fi
+    else
+      die "$MEM_LABEL が足りないため pull を中止しました（重みを無駄に落とさずに済みました）。
+
+     対策:
+       NUM_CTX を下げる       :  NUM_CTX=8192 bash scripts/20_ollama.sh
+       小さいモデルにする     :  MODEL_PROFILE=qwen3-14b bash scripts/20_ollama.sh
+       それでも試す           :  FORCE_VRAM=1 bash scripts/20_ollama.sh"
+    fi
+    ;;
+  2) die "モデル名を解決できませんでした: $BASE_MODEL
+     タグの綴りを確認してください（https://ollama.com/library）" ;;
+  *) warn "事前チェックを実施できませんでした。pull 後の判定に任せます。" ;;
+esac
+
+hdr "4. ベースモデルの取得"
 if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$BASE_MODEL"; then
   ok "取得済み: $BASE_MODEL"
 else
   log "pull します: $BASE_MODEL"
-  warn "14B q4_K_M で約 9GB。回線次第で数分〜十数分かかります。"
+  # ★ サイズをモデル決め打ちで書かないこと。以前は「14B q4_K_M で約 9GB」と
+  #   固定文言だったため、gpt-oss:20b を pull している最中に 14B の話が出た。
+  #   手順 3 の事前チェックが実測値を JSON に残しているので、それを使う。
+  PULL_GIB="$(python3 -c "
+import json, sys
+try:
+    print('%.1f' % (json.load(open('$STATEDIR/vram-precheck.json'))['weights_mib'] / 1024))
+except Exception:
+    print('')
+" 2>/dev/null)"
+  if [ -n "$PULL_GIB" ]; then
+    warn "重みは約 ${PULL_GIB}GB です。回線次第で数分〜十数分かかります。"
+  else
+    warn "重みを丸ごと落とします。回線次第で数分〜十数分かかります。"
+  fi
   ollama pull "$BASE_MODEL"
   ok "pull 完了: $BASE_MODEL"
 fi
 
-hdr "4. Cline 用モデルの作成 (num_ctx=$NUM_CTX)"
+hdr "5. Cline 用モデルの作成 (num_ctx=$NUM_CTX)"
 # ここが最重要。Ollama の既定 num_ctx は小さく、Cline のシステムプロンプトと
 # ファイル内容で即あふれる。あふれた分は "静かに切り捨てられる" ため、
 # 「指示を忘れる」「無いファイルを捏造する」という形で症状が出る。
@@ -90,7 +173,7 @@ sed 's/^/      /' "$MODELFILE"
 ollama create "$CLINE_MODEL" -f "$MODELFILE"
 ok "作成しました: $CLINE_MODEL"
 
-hdr "5. ウォームアップ（VRAM へのロード）"
+hdr "6. ウォームアップ（VRAM へのロード）"
 log "モデルを VRAM に載せます（初回は 30〜90 秒）"
 curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
      -H 'Content-Type: application/json' \
@@ -98,7 +181,15 @@ curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
      -o "$STATEDIR/warmup.json"
 ok "ロード完了"
 
-hdr "6. 速度ベンチマーク（この構成でいちばん重要な数字）"
+hdr "7. 速度ベンチマーク（この構成でいちばん重要な数字）"
+# ★ CPU では、ここで出る数字は「この構成の実力」ではない。判定 NG も当然出る。
+#   消さずに残すのは、進捗の把握（生きているか / どれくらい待つか）に使えるから。
+#   結論に使ってはいけない、とだけ明示する。
+if [ "$ACCEL" = "cpu" ]; then
+  warn "CPU モードです。以下の数字と判定は**参考値**で、この構成の実力ではありません。
+       CPU で 12B 級を回すと生成は数 tok/s になり、判定はまず NG になります。
+       モデル選定の根拠にはせず、T4 を確保してから測り直してください（手順書 §13）。"
+fi
 # Cline CLI は Ollama へのリクエストを 30 秒でタイムアウトする（cline#9182）。
 # VS Code 拡張と違い、CLI 側にタイムアウト設定が無い。
 # したがって「30 秒でプロンプトを何トークン処理できるか」が実用性の上限を決める。
@@ -123,12 +214,38 @@ print(json.dumps({
 }))
 PY
 
+# ★ 上限を固定の 900 にしてはいけない。CPU 実行では足りない。
+#   2026-09-18 実測（Colab CPU ランタイム 2 コア / gemma4:12b-it-qat）:
+#     prefill 4.0 tok/s、generation 1.04 tok/s
+#   このベンチは約 4,000 トークンの prefill と 256 トークン生成なので、
+#   900 秒では終わらず curl(28) で落ち、セットアップ全体が失敗していた。
+#   CPU では既定を大きく取り、なお超えたら「遅すぎる」ことを結論として扱う。
+BENCH_MAX_SEC="${BENCH_MAX_SEC:-$([ "$ACCEL" = "cpu" ] && echo 3600 || echo 900)}"
+log "ベンチの上限: ${BENCH_MAX_SEC}s（ACCEL=$ACCEL）"
+
 BENCH_START=$(date +%s)
-curl -fsS --max-time 900 "$OLLAMA_BASE_URL/api/generate" \
+set +e
+curl -fsS --max-time "$BENCH_MAX_SEC" "$OLLAMA_BASE_URL/api/generate" \
      -H 'Content-Type: application/json' \
      --data-binary "@$STATEDIR/bench-req.json" -o "$STATEDIR/bench-resp.json"
+BENCH_RC=$?
+set -e
 BENCH_END=$(date +%s)
 
+# ★ ベンチが終わらなくてもセットアップ全体を失敗させない。
+#   ベンチは「この構成の速度を知る」ための計測であって、環境構築の必須段ではない。
+#   ここで die すると、モデルもエージェントも揃っているのに全部やり直しになる
+#   （実機で踏んだ: CPU で 900 秒を超えて 00_setup_all.sh ごと失敗した）。
+if [ "$BENCH_RC" -ne 0 ]; then
+  warn "ベンチが ${BENCH_MAX_SEC}s 以内に終わりませんでした (curl exit=$BENCH_RC)。
+       この構成は**このベンチを完走できないほど遅い**という結論になります。
+       モデルとエージェントの導入自体は完了しているので、続行します。
+       速度を測り直すなら BENCH_MAX_SEC を伸ばしてください。"
+  printf '%s\n' "ベンチ未完了（${BENCH_MAX_SEC}s 超過）" >"$STATEDIR/bench-summary.txt"
+  printf '{"verdict":"TIMEOUT","bench_max_sec":%s}\n' "$BENCH_MAX_SEC" >"$STATEDIR/bench.json"
+fi
+
+if [ "$BENCH_RC" -eq 0 ]; then
 python3 - "$STATEDIR/bench-resp.json" "$((BENCH_END - BENCH_START))" \
          "$CLINE_REQUEST_BUDGET_SEC" "$NUM_CTX" "$STATEDIR/bench.json" <<'PY' \
   | tee "$STATEDIR/bench-summary.txt"
@@ -212,10 +329,12 @@ elif safe_tokens >= 6000:
            "      より小さいモデルへの切り替えを検討する価値があります。")
 else:
     verdict = "NG"
-    msg = ("Cline のシステムプロンプトだけで 30 秒を超えます。この構成では実用になりません。\n"
+    msg = (f"エージェントのシステムプロンプトだけで {budget} 秒を超えます。かなり厳しい構成です。\n"
            "      対策: (1) BASE_MODEL をより小さいものにする\n"
-           "            (2) CLINE_PROVIDER=openai-compatible を試す（/v1 経由で 30 秒制限を回避できる可能性）\n"
-           "            (3) モデルが VRAM に載り切っているか確認する（CPU オフロードは致命的に遅い）")
+           "            (2) モデルが VRAM に載り切っているか確認する（CPU オフロードは致命的に遅い）\n"
+           "            (3) 1 応答を短く保つよう AGENTS.md / .cline/rules で誘導する\n"
+           "      ※ この判定は CLINE_REQUEST_BUDGET_SEC を基準にした机上の値です。\n"
+           "        実タスクが完走するかは --eval で実測してください（乖離した実績あり）。")
 
 print(f"      判定: {verdict}")
 print(f"      {msg}")
@@ -232,18 +351,18 @@ with open(out_path, "w", encoding="utf-8") as f:
                "safe_prompt_tokens": safe_tokens, "verdict": verdict,
                "typical_out_tokens": TYPICAL_OUT, "thinking_detected": thinking}, f)
 PY
+fi
 
-hdr "7. VRAM 実測"
-nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
-           --format=csv,noheader | sed 's/^/      /'
-VRAM_FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)"
-if [ "$VRAM_FREE_MIB" -lt 512 ]; then
-  warn "空き VRAM が ${VRAM_FREE_MIB}MiB しかありません。長い文脈を投げた瞬間に OOM します。
+hdr "8. $MEM_LABEL 実測"
+accel_mem_report | sed 's/^/      /'
+MEM_FREE_MIB="$(accel_free_mib)"
+if [ "$MEM_FREE_MIB" -lt 512 ]; then
+  warn "空き $MEM_LABEL が ${MEM_FREE_MIB}MiB しかありません。長い文脈を投げた瞬間に OOM します。
        NUM_CTX を下げる（32768 -> 16384）か、BASE_MODEL を 7B 級に落としてください。"
-elif [ "$VRAM_FREE_MIB" -lt 1500 ]; then
-  warn "空き VRAM ${VRAM_FREE_MIB}MiB。動きますが余裕がありません。長時間セッションでは NUM_CTX を下げる方が安全です。"
+elif [ "$MEM_FREE_MIB" -lt 1500 ]; then
+  warn "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。動きますが余裕がありません。長時間セッションでは NUM_CTX を下げる方が安全です。"
 else
-  ok "空き VRAM ${VRAM_FREE_MIB}MiB。余裕があります。"
+  ok "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。余裕があります。"
 fi
 
 hdr "完了"

@@ -7,26 +7,42 @@
 . "$(cd "$(dirname "$0")" && pwd)/common.sh"
 ensure_dirs
 
-hdr "1. GPU"
-if ! have nvidia-smi; then
-  die "nvidia-smi がありません。ランタイムのタイプが GPU になっていない可能性があります。
-     Colab メニュー: ランタイム > ランタイムのタイプを変更 > ハードウェア アクセラレータ = T4 GPU"
+hdr "1. アクセラレータ ($ACCEL)"
+# ★ 以前はここで nvidia-smi が無ければ die していた。しかし無料枠の T4 は
+#   取れないことのほうが多く、「GPU が無い」というだけで、CPU でも潰せる検証
+#   （ツール呼び出しが成立するか / Cline が何秒で切るか）まで T4 待ちになっていた。
+#   CPU は CPU として先へ進め、GPU 固有の項目だけを飛ばす。手順書 §13 を参照。
+if [ "$ACCEL" = "cpu" ]; then
+  warn "nvidia-smi がありません。CPU モードで続行します。
+     GPU を使うつもりだったなら、ランタイムのタイプを確認してください:
+     Colab メニュー > ランタイム > ランタイムのタイプを変更 > T4 GPU
+     CPU のままで良い場合は、このまま進めて構いません（手順書 §13）。"
+  GPU_NAME="(GPU 無し / CPU モード)"
+  MEM_TOTAL_MIB="$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo)"
+  MEM_FREE_MIB="$(accel_free_mib)"
+else
+  # ★ 出力する項目名も併記すること。ヘッダ無しの CSV だと remote/01_new.sh が
+  #   出す memory.free と見分けが付かず、「空き 0 MiB」と読み違える（実際にやった）。
+  nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version \
+             --format=csv,noheader \
+    | sed 's/^/    /; s/$/  (name, total, used, driver)/'
+
+  GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+  MEM_TOTAL_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)"
+  MEM_USED_MIB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)"
+  MEM_FREE_MIB=$((MEM_TOTAL_MIB - MEM_USED_MIB))
+
+  case "$GPU_NAME" in
+    *T4*) ok "Tesla T4 (sm_75)。bf16 非対応・FlashAttention2 非対応。GGUF 量子化前提で進めます。" ;;
+    *L4*|*A100*|*H100*|*L40*) ok "$GPU_NAME。T4 より条件が良いので、より大きいモデル/長い num_ctx を検討できます。" ;;
+    *)    warn "想定外の GPU: $GPU_NAME。続行しますが VRAM 見積もりは手順書 §6 を読み替えてください。" ;;
+  esac
 fi
-nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version \
-           --format=csv,noheader | sed 's/^/    /'
-
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
-VRAM_TOTAL_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)"
-VRAM_USED_MIB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)"
-VRAM_FREE_MIB=$((VRAM_TOTAL_MIB - VRAM_USED_MIB))
-
-case "$GPU_NAME" in
-  *T4*) ok "Tesla T4 (sm_75)。bf16 非対応・FlashAttention2 非対応。GGUF 量子化前提で進めます。" ;;
-  *L4*|*A100*|*H100*|*L40*) ok "$GPU_NAME。T4 より条件が良いので、より大きいモデル/長い num_ctx を検討できます。" ;;
-  *)    warn "想定外の GPU: $GPU_NAME。続行しますが VRAM 見積もりは手順書 §6 を読み替えてください。" ;;
-esac
 
 hdr "2. Compute Capability"
+if [ "$ACCEL" = "cpu" ]; then
+  log "CPU モードなのでスキップします"
+else
 python3 - <<'PY' || warn "torch が無いため CC の確認をスキップしました（致命的ではありません）"
 import sys
 try:
@@ -43,6 +59,7 @@ if cc < (8, 0):
 else:
     print("    -> bf16 対応。vLLM も選択肢に入ります。")
 PY
+fi
 
 hdr "3. システム RAM / ディスク"
 free -h | sed 's/^/    /'
@@ -102,28 +119,74 @@ else
 fi
 
 hdr "7. ネットワーク疎通"
-for host in ollama.com registry.npmjs.org deb.nodesource.com; do
-  if curl -fsS --max-time 8 -o /dev/null "https://$host" 2>/dev/null; then
-    ok "$host  到達可"
+# ★ registry.ollama.ai を独立して見ること。ollama.com はインストーラの配布元で、
+#   モデルの重みを配るのは registry.ollama.ai。egress ポリシーで後者だけが
+#   塞がれている環境が実在し（Claude on the web の既定ポリシーがそう）、
+#   その場合は ollama のインストールまで通ってから pull だけが失敗する。
+#   どちらが落ちたのかを区別できないと、原因の切り分けに時間を使う。
+#
+# ★ 「到達できたか」は HTTP ステータスで判断してはいけない。
+#   registry.ollama.ai はルートに GET すると **404 を返すのが正常**
+#   （/v2/<name>/manifests/<tag> しか生えていない）。ここで curl -f を使うと
+#   404 で失敗扱いになり、**実際には pull できる環境を「届きません」と誤判定する**。
+#   実際に踏んだ: レジストリからマニフェストを取得できている機械で
+#   「registry.ollama.ai に届きません」と出た（2026-09-18）。
+#   しかもこの判定は 60_cpu_verify.sh が L2 を飛ばすかどうかに使われるので、
+#   誤判定すると「pull できるのに検証を丸ごと飛ばす」という最悪の方向に倒れる。
+#
+#   欲しいのは「egress ポリシーに塞がれていないか」なので、
+#   **HTTP 応答が返ってきたか** だけを見る。塞がれている場合、curl は
+#   CONNECT の失敗（exit 56）になり http_code は 000 になる。
+#   200 でも 401 でも 404 でも、応答が返る時点でホストには届いている。
+NET_REGISTRY_OK=1
+for host in ollama.com registry.ollama.ai registry.npmjs.org deb.nodesource.com; do
+  # ★ `|| echo 000` を足してはいけない。curl は失敗時にも -w の書式を評価して
+  #   "000" を stdout に出すので、フォールバックが連結されて "000000" になり、
+  #   != "000" の判定をすり抜けて **到達不可を到達可と誤報する**（実際に踏んだ）。
+  #   終了コードは捨て、出力が空のときだけ 000 を補う。
+  code="$(curl -sS --max-time 8 -o /dev/null -w '%{http_code}' \
+          "https://$host" 2>/dev/null)" || true
+  [ -n "$code" ] || code=000
+  if [ "$code" != "000" ]; then
+    ok "$host  到達可 (HTTP $code)"
   else
-    warn "$host  到達不可（後段のインストールが失敗します）"
+    warn "$host  到達不可（egress ポリシーに塞がれている可能性）"
+    [ "$host" = "registry.ollama.ai" ] && NET_REGISTRY_OK=0
   fi
 done
+# 後続（60_cpu_verify.sh）が「pull で長時間待たずに即座に理由を言う」ために読む。
+mkdir -p "$STATEDIR"
+printf '%s\n' "$NET_REGISTRY_OK" >"$STATEDIR/net-registry-ok"
+if [ "$NET_REGISTRY_OK" -eq 0 ]; then
+  warn "registry.ollama.ai に届きません。ollama のインストールは通っても
+     ollama pull は必ず失敗します。ネットワークポリシーで許可してください
+     （Claude on the web なら環境のネットワーク設定、社内 proxy なら許可リスト）。"
+fi
 
 hdr "8. 判定サマリ"
 FAIL=0
+MEM_LABEL="$(accel_mem_label)"
+printf '    %-28s %s\n' "アクセラレータ"  "$ACCEL"
 printf '    %-28s %s\n' "GPU"            "$GPU_NAME"
-printf '    %-28s %s MiB (空き %s MiB)\n' "VRAM" "$VRAM_TOTAL_MIB" "$VRAM_FREE_MIB"
+printf '    %-28s %s MiB (空き %s MiB)\n' "$MEM_LABEL" "$MEM_TOTAL_MIB" "$MEM_FREE_MIB"
 printf '    %-28s %s GB\n' "システム RAM"  "$RAM_GB"
 printf '    %-28s %s GB\n' "$WORKROOT 空き" "$DISK_AVAIL_GB"
 
-if [ "$VRAM_FREE_MIB" -lt 7000 ]; then
-  warn "空き VRAM が 7GB 未満です。7B q4_K_M すら厳しい状態です。ランタイムを作り直してください。"
+# しきい値は GPU（T4 の 15GB）を前提に決めてある。CPU はシステム RAM 全体を
+# 見ているので同じ数字では判断できない。判定の言葉も変える。
+if [ "$MEM_FREE_MIB" -lt 7000 ]; then
+  warn "空き $MEM_LABEL が 7GB 未満です。7B q4_K_M すら厳しい状態です。"
   FAIL=1
-elif [ "$VRAM_FREE_MIB" -lt 13000 ]; then
-  log "空き VRAM ${VRAM_FREE_MIB}MiB。7B 級（既定）で進めてください。14B は載りません。"
+elif [ "$MEM_FREE_MIB" -lt 13000 ]; then
+  log "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。7B 級（既定）で進めてください。14B は載りません。"
 else
-  log "空き VRAM ${VRAM_FREE_MIB}MiB。14B q4_K_M も選択肢に入ります（手順書 §5 の実測結果で判断）。"
+  log "空き $MEM_LABEL ${MEM_FREE_MIB}MiB。12〜14B 級も選択肢に入ります（手順書 §5 の実測結果で判断）。"
+fi
+if [ "$ACCEL" = "cpu" ]; then
+  warn "CPU モードです。推論は GPU の一桁以上遅くなります。
+     ここで測る速度は実力ではないので、ベンチの判定は参考値として扱ってください。
+     CPU で確定させられるのは「ツール呼び出しが成立するか」「何秒で切られるか」で、
+     速度の評価は T4 の仕事です（手順書 §13）。"
 fi
 if [ "$DISK_AVAIL_GB" -lt 20 ]; then
   warn "ディスク空きが 20GB 未満です。モデル + Node + Cline CLI で足りなくなる恐れがあります。"

@@ -33,7 +33,91 @@ UPSTREAM = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/
 LISTEN_PORT = int(os.environ.get("CODEX_PROXY_PORT", "11435"))
 
 _TOOL_CALL_TAG_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+# --- gpt-oss（harmony 形式）がツール呼び出しをテキストに漏らす ---------------
+# 本来は harmony のチャネル構文で構造化出力になるが、これをそのまま本文に
+# 書き出してしまうことがある:
+#     to=functions.<NAME> <|constrain|>json<|message|>{ ...引数... }<|call|>
+# マーカーは欠けることがあるので constrain / message は任意にしてある。
+# 名前の直後に JSON が続くことを _find_harmony_tool_calls 側で確認するので、
+# 単なる言及（JSON が続かない文）を誤って拾うことはない。
+_HARMONY_CALL_RE = re.compile(
+    r"to\s*=\s*functions\.(?P<name>[A-Za-z0-9_][A-Za-z0-9_.\-]*)"
+    r"(?:\s*<\|constrain\|>\s*[A-Za-z0-9_]+)?"
+    r"(?:\s*<\|message\|>)?"
+)
+
+# --- gpt-oss + Ollama のツール呼び出しパース失敗への再送 ---------------------
+# ollama/ollama#17638（2026-08-09 報告・未修正。手元の 0.34.1 でも再現）:
+#   gpt-oss の出力が array-wrap になり、開き括弧が無いまま末尾に ] だけ残る。
+#       {"cmd":"apply_patch <<'PATCH' ... PATCH"]}
+#   Ollama は自分で生成させた出力を自分でパースできず HTTP 500 を返す。
+#       error parsing tool call: raw='...', err=invalid character ']' ...
+#
+# 発生条件は「単一のフリーフォーム文字列引数を取る patch 系ツール」「長いツール
+# 説明文」「複数ターン」で、**非決定的**（報告ではおおむね 5 回中 2 回）。
+#
+# 原因は上流にあり、このプロキシからは生のテキストが見えない（Ollama の内部で
+# 落ちて 500 になるため、修復のしようがない）。だが非決定的なので、
+# **同じリクエストを投げ直せば通る見込みが高い**。温度 0.2 でサンプリングして
+# いるので再送のたびに出力は変わる。
+#
+# これは対症療法である。上流が直れば不要になる。
+_TOOL_PARSE_ERR_RE = re.compile(r"error parsing tool call", re.IGNORECASE)
+TOOLCALL_RETRIES = int(os.environ.get("CODEX_PROXY_TOOLCALL_RETRIES", "3"))
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+# --- Gemma 4 系がツール呼び出しをテキストに漏らす ---------------------------
+# §5.6 / §5.8 / §12.7 と同じ系統の症状が Gemma 4 でも報告されている。
+# 漏れ方が 2 通りあり、どちらも既存の
+# 「{"name": ..., "arguments": {...}} を探す」ロジックでは拾えない。
+#
+# (1) ollama/ollama#15539（ollama 0.20.6 / gemma4:e4b）
+#     system prompt + think:false + tools が揃うとパーサが取りこぼし、
+#     **ラッパー付きの JSON** が content に落ちる:
+#         {"tool_calls":[{"function":"GetLiveContext","args":{}}]}
+#         <channel|>
+#     キー名が name/arguments ではなく function/args である点が肝。
+#     末尾の <channel|> は raw_decode が無視するので前処理は要らない。
+#
+# (2) ollama/ollama#15798（ollama 0.21.1 / gemma4-64k、Closed as not planned）
+#     チャットテンプレートの特殊トークンが本文にそのまま漏れる:
+#         <|tool_call|> / <|channel|> / <|tool_response|>
+#     加えて "call:" プレフィックスが付き、文字列引数が本来の引用符ではなく
+#     <|"|>...<|"|> で囲まれる。finish_reason は stop になるため、
+#     クライアントは「普通に喋っただけ」と解釈してターンを終える。
+#
+# ★ (2) は issue に逐語のサンプルが無く、**記述から起こした実装**である。
+#   実機の生応答は scripts/34_toolcall_probe.sh が *.content.txt に保存するので、
+#   採取できたら test_tool_proxy_gemma4.py のデータを実物に差し替え、
+#   ここの正規表現も必要に応じて直すこと。
+#   （test_tool_proxy_harmony.py が実機採取の文字列を使っているのと同じ流儀）
+# ★ トークンは **左右非対称** である。2026-09-18 にレジストリから
+#   gemma4:12b-it-qat の GGUF メタデータ（tokenizer.chat_template, 17,466 文字）を
+#   Range 取得して実物を確認した。issue #15798 の文中にある `<|tool_call|>` という
+#   表記は不正確で、実際には開きが `<|tool_call>`、閉じが `<tool_call|>`。
+#   当初この対称形を仮定して実装しており、**実出力には一致しなかった**。
+#
+#   テンプレートに現れるトークンの全体（`<|"|>` 以外すべて非対称）:
+#       <|tool_call>     … <tool_call|>
+#       <|tool_response> … <tool_response|>
+#       <|channel>       … <channel|>
+#       <|turn>          … <turn|>
+#       <|tool>          … <tool|>
+#       <|"|>            （これだけ対称。文字列の引用に使う）
+#   36_registry_probe.py がテンプレートから実際に拾ったトークンの全体:
+#       <|tool_call> <|tool_response> <|channel> <|turn> <|tool>   （開き・非対称）
+#       <tool_call|> <tool_response|> <channel|> <turn|> <tool|>   （閉じ・非対称）
+#       <|"|> <|think|> <|image|> <|audio|> <|video|>              （対称）
+_GEMMA_TOKEN_RE = re.compile(
+    r"<\|(?:tool_call|tool_response|channel|turn|tool)>"
+    r"|<(?:tool_call|tool_response|channel|turn|tool)\|>"
+    r"|<\|(?:think|image|audio|video)\|>"
+)
+_GEMMA_QUOTE = '<|"|>'
+_GEMMA_QUOTE_RE = re.compile(re.escape(_GEMMA_QUOTE))
+_GEMMA_CALL_OPEN = "<|tool_call>call:"
+_GEMMA_CALL_CLOSE = "<tool_call|>"
 
 _id_counter = itertools.count()
 
@@ -65,6 +149,270 @@ def _extract_json_objects(text: str):
     return objs
 
 
+def _first_json_object(text: str):
+    """text の先頭（空白等を読み飛ばした位置）から JSON を 1 つだけ読む。
+
+    _extract_json_objects と違い「どこかにある JSON」を探さない。
+    harmony の <|message|> 直後という位置が意味を持つので、そこから読む。
+    見つからなければ None。
+    """
+    decoder = json.JSONDecoder()
+    i = 0
+    n = len(text)
+    # 前置きとして現れうるものだけ読み飛ばす（コードフェンス / 空白 / 改行）
+    while i < n and (text[i].isspace() or text[i] == "`"):
+        i += 1
+    if i >= n or text[i] != "{":
+        return None
+    try:
+        obj, _ = decoder.raw_decode(text, i)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _find_harmony_tool_calls(text: str, valid_tool_names: set[str]):
+    """gpt-oss の harmony 形式のツール呼び出しがテキストに漏れたものを拾う。
+
+    なぜ必要か（実機で観測、2026-09-17）:
+      gpt-oss は本来 harmony のチャネル構文で構造化出力を出す:
+
+        <|channel|>commentary to=functions.apply_patch <|constrain|>json
+        <|message|>{"patch":"*** Begin Patch ..."}<|call|>
+
+      ところが**この構文をそのままプレーンテキストとして本文に書き出し**、
+      ツール呼び出しを発行しないまま「どう呼ぼうか」と延々と悩んで
+      出力トークンを使い切ることがある（model_max_output_tokens 8192 に対し
+      9,196 / 12,936 トークン使って打ち切られた実例あり）。
+      結果、ファイルが 1 つも作られないまま終わる。
+
+      §5.6 / §5.8 の「構造化出力にせずテキストで返す」と同じ系統の症状。
+      既存の修復は {"name":..., "arguments":...} 形しか見ていないが、
+      harmony ではツール名が JSON の**外側**（to=functions.NAME）にあるため
+      拾えない。ここで拾って正しい tool_calls に組み替える。
+
+    誤爆を避けるため、次をすべて満たすものだけ拾う:
+      - ツール名が valid_tool_names にある
+      - 名前の直後（constrain/message マーカーを挟んでもよい）に
+        パース可能な JSON オブジェクトが続く
+    単に "to=functions.exec_command を使えばよい" と言及しただけの文（JSON が
+    続かない）は拾わない。
+    """
+    found = []
+    for m in _HARMONY_CALL_RE.finditer(text):
+        name = m.group("name")
+        if name not in valid_tool_names:
+            continue
+        args = _first_json_object(text[m.end():])
+        if args is None:
+            continue
+        found.append({"name": name, "arguments": args})
+    return found
+
+
+def _gemma_normalize(text: str) -> str:
+    """Gemma 4 のテンプレート特殊トークンを剥がして、素の JSON に近づける。
+
+    ollama#15798 で本文に漏れると報告されている装飾だけを落とす:
+      <|tool_call|> / <|channel|> / <|tool_response|> / <|call|> / <|message|>
+      行頭の "call:" プレフィックス
+      文字列引数を囲む <|"|> を本来の " に戻す
+
+    ★ 元の text を壊さないこと。ここで作った文字列は **追加の候補** として
+      扱い、元の text も従来どおり走査する（_candidate_texts 参照）。
+      装飾が無い応答に対しては何も変わらない。
+    """
+    if "<|" not in text and "<tool" not in text and "<channel" not in text:
+        return text
+    out = _GEMMA_QUOTE_RE.sub('"', text)
+    out = _GEMMA_TOKEN_RE.sub("", out)
+    # `<|tool_call>call:` の "call:" は上でトークンを剥がすと行頭に残る。
+    # ネイティブ形式は _find_gemma_native_tool_calls が別途扱うので、
+    # ここでは JSON が続くケース（#15539 系）のために取り除くだけにする。
+    out = re.sub(r"(?:^|\n)\s*call:\s*", "\n", out)
+    return out
+
+
+def _gemma_parse_value(text: str, i: int):
+    """Gemma 4 のツール引数 1 個を読み、(値, 次の位置) を返す。失敗時は (None, i)。
+
+    テンプレートの format_argument マクロが吐く形をそのまま読む:
+        文字列  <|"|>...<|"|>      （**キーは裸なので JSON ではない**）
+        真偽値  true / false
+        写像    {key:VALUE,key:VALUE}
+        配列    [VALUE,VALUE]
+        それ以外はそのままの字面（数値など）
+    """
+    n = len(text)
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n:
+        return None, i
+
+    # 文字列: <|"|> ... <|"|>
+    if text.startswith(_GEMMA_QUOTE, i):
+        start = i + len(_GEMMA_QUOTE)
+        end = text.find(_GEMMA_QUOTE, start)
+        if end == -1:
+            return None, i
+        return text[start:end], end + len(_GEMMA_QUOTE)
+
+    # 写像
+    if text[i] == "{":
+        obj, i = {}, i + 1
+        while True:
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == "}":
+                return obj, i + 1
+            # キーは裸。次の ':' まで
+            colon = text.find(":", i)
+            if colon == -1:
+                return None, i
+            key = text[i:colon].strip()
+            if not key:
+                return None, i
+            val, i = _gemma_parse_value(text, colon + 1)
+            if val is None and i == colon + 1:
+                return None, i
+            obj[key] = val
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            if i < n and text[i] == "}":
+                return obj, i + 1
+            return None, i
+
+    # 配列
+    if text[i] == "[":
+        arr, i = [], i + 1
+        while True:
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == "]":
+                return arr, i + 1
+            val, i = _gemma_parse_value(text, i)
+            if val is None:
+                return None, i
+            arr.append(val)
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            if i < n and text[i] == "]":
+                return arr, i + 1
+            return None, i
+
+    # 素の字面（true / false / 数値など）。区切りまで読む。
+    j = i
+    while j < n and text[j] not in ",}]":
+        j += 1
+    raw = text[i:j].strip()
+    if raw == "true":
+        return True, j
+    if raw == "false":
+        return False, j
+    if raw == "null":
+        return None, j
+    try:
+        return int(raw), j
+    except ValueError:
+        pass
+    try:
+        return float(raw), j
+    except ValueError:
+        pass
+    return (raw if raw else None), j
+
+
+def _find_gemma_native_tool_calls(text: str, valid_tool_names: set[str]):
+    """Gemma 4 がテンプレートどおりの形で本文に吐いたツール呼び出しを拾う。
+
+    実際の形式（GGUF の chat_template で確認、2026-09-18）:
+
+        <|tool_call>call:write_file{content:<|"|>hi<|"|>,path:<|"|>a.txt<|"|>}<tool_call|>
+
+    ★ これは JSON ではない。キーが裸で、文字列が <|"|> で囲まれている。
+      よって「<|"|> を " に置換して json.loads」では絶対に読めない。専用に読む。
+      （当初はそれで済むと仮定した実装を入れていたが、テンプレート実物と
+       突き合わせて誤りと分かった。）
+
+    引数が文字列として渡された場合、テンプレートは中身をそのまま出すので
+    オブジェクトとして読めないことがある。その場合は生文字列のまま返す
+    （_args_to_str が文字列をそのまま扱える）。
+
+    誤爆防止は既存方針どおり、ツール名が valid_tool_names にあるものだけ。
+    """
+    found = []
+    pos = 0
+    while True:
+        start = text.find(_GEMMA_CALL_OPEN, pos)
+        if start == -1:
+            break
+        i = start + len(_GEMMA_CALL_OPEN)
+        brace = text.find("{", i)
+        if brace == -1:
+            break
+        name = text[i:brace].strip()
+        close = text.find(_GEMMA_CALL_CLOSE, brace)
+        pos = (close + len(_GEMMA_CALL_CLOSE)) if close != -1 else brace + 1
+        if name not in valid_tool_names:
+            continue
+        args, end = _gemma_parse_value(text, brace)
+        if not isinstance(args, dict):
+            # 引数が文字列だった場合など。閉じトークンまでを生で渡す。
+            if close != -1:
+                raw = text[brace + 1:close].rstrip()
+                raw = raw[:-1] if raw.endswith("}") else raw
+                args = raw
+            else:
+                continue
+        found.append({"name": name, "arguments": args})
+    return found
+
+
+def _find_gemma_wrapped_tool_calls(text: str, valid_tool_names: set[str]):
+    """{"tool_calls":[{"function":NAME,"args":{...}}]} 形を拾う（ollama#15539）。
+
+    既存の _find_tool_calls_in_text はトップレベルに name と arguments を
+    持つオブジェクトしか見ないので、この形は素通りしてしまう。
+
+    キー名は実装によって揺れるため、function/name と args/arguments の
+    どちらも受ける。誤爆防止は既存方針どおり「ツール名が有効集合にあること」。
+    """
+    found = []
+    for obj in _extract_json_objects(text):
+        if not isinstance(obj, dict):
+            continue
+        calls = obj.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            # {"function": "NAME", ...} と {"function": {"name": "NAME"}} の両方
+            fn = call.get("function")
+            name = fn if isinstance(fn, str) else None
+            if name is None and isinstance(fn, dict):
+                name = fn.get("name")
+            if name is None:
+                name = call.get("name")
+            if not isinstance(name, str) or name not in valid_tool_names:
+                continue
+            args = call.get("args")
+            if args is None and isinstance(fn, dict):
+                args = fn.get("arguments")
+            if args is None:
+                args = call.get("arguments")
+            if args is None:
+                args = {}
+            found.append({"name": name, "arguments": args})
+    return found
+
+
 def _candidate_texts(content: str):
     """content から「JSON があるかもしれない箇所」の候補文字列を列挙する。"""
     yield content
@@ -72,6 +420,12 @@ def _candidate_texts(content: str):
         yield m.group(1)
     for m in _CODE_FENCE_RE.finditer(content):
         yield m.group(1)
+    # Gemma 4 の特殊トークンを剥がした版。元の content と違うときだけ足す。
+    normalized = _gemma_normalize(content)
+    if normalized != content:
+        yield normalized
+        for m in _CODE_FENCE_RE.finditer(normalized):
+            yield m.group(1)
 
 
 def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
@@ -82,6 +436,24 @@ def _find_tool_calls_in_text(text: str, valid_tool_names: set[str]):
     """
     if not isinstance(text, str) or not text.strip():
         return []
+    # harmony 形式を先に見る。形が具体的なぶん誤爆しにくく、
+    # ツール名が JSON の外側にあるため下の汎用ロジックでは拾えない。
+    harmony = _find_harmony_tool_calls(text, valid_tool_names)
+    if harmony:
+        return harmony
+    # Gemma 4 がテンプレートどおりのネイティブ形式で吐いた場合（ollama#15798）。
+    # <|tool_call>call:NAME{...}<tool_call|> は JSON ではないので専用に読む。
+    # いちばん形が具体的なので最優先で見る。
+    native = _find_gemma_native_tool_calls(text, valid_tool_names)
+    if native:
+        return native
+    # Gemma 4 のラッパー形（ollama#15539）。こちらもトップレベルに
+    # name/arguments を持たないので、下の汎用ロジックでは拾えない。
+    # 特殊トークンが被っている場合に備え、剥がした版でも試す。
+    for candidate in (text, _gemma_normalize(text)):
+        wrapped = _find_gemma_wrapped_tool_calls(candidate, valid_tool_names)
+        if wrapped:
+            return wrapped
     found = []
     seen = set()
     for candidate in _candidate_texts(text):
@@ -278,6 +650,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # pragma: no cover - network failure path
             self._send_json(502, {"error": {"message": str(e)}})
 
+    def _post_upstream(self, path: str, data: bytes):
+        """上流へ POST し、パース済み body を返す。
+
+        ollama/ollama#17638（gpt-oss のツール呼び出しが array-wrap になり
+        Ollama 自身がパースに失敗して 500 を返す）は**非決定的**なので、
+        その 500 に限って投げ直す。それ以外のエラーはそのまま客に返す。
+
+        失敗して応答を送信済みの場合は None を返す。
+        """
+        last_err_body = b""
+        for attempt in range(1, TOOLCALL_RETRIES + 2):
+            try:
+                req = urllib.request.Request(
+                    f"{UPSTREAM}{path}", data=data, method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read()
+                # 再送して意味があるのは、上流がツール呼び出しのパースに
+                # 失敗したときだけ。400 などを投げ直しても同じ結果になる。
+                if e.code >= 500 and _TOOL_PARSE_ERR_RE.search(
+                    body.decode("utf-8", "replace")
+                ):
+                    last_err_body = body
+                    if attempt <= TOOLCALL_RETRIES:
+                        _log(f"upstream {e.code} error parsing tool call "
+                             f"(ollama#17638) — 再送します "
+                             f"({attempt}/{TOOLCALL_RETRIES})")
+                        continue
+                    _log(f"upstream {e.code} error parsing tool call — "
+                         f"{TOOLCALL_RETRIES} 回再送しても直りませんでした")
+                    self._send_bytes(e.code, "application/json", last_err_body)
+                    return None
+                self._send_bytes(e.code, "application/json", body)
+                return None
+            except Exception as e:
+                self._send_json(502, {"error": {"message": str(e)}})
+                return None
+        return None
+
     def do_GET(self):
         self._proxy_passthrough("GET", self.path, b"")
 
@@ -311,19 +725,9 @@ class Handler(BaseHTTPRequestHandler):
             valid_tool_names.discard(None)
 
         upstream_data = json.dumps(req_body).encode("utf-8")
-        try:
-            up_req = urllib.request.Request(
-                f"{UPSTREAM}{path}", data=upstream_data, method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(up_req, timeout=600) as resp:
-                resp_body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            self._send_bytes(e.code, "application/json", e.read())
-            return
-        except Exception as e:
-            self._send_json(502, {"error": {"message": str(e)}})
-            return
+        resp_body = self._post_upstream(path, upstream_data)
+        if resp_body is None:
+            return  # エラー応答は _post_upstream が送信済み
 
         if path == "/v1/responses":
             repaired = _repair_responses_body(resp_body, valid_tool_names)
